@@ -733,6 +733,82 @@ async def list_tools() -> list[types.Tool]:
                 "required": [],
             },
         ),
+        # ── TEAM: request_team_write ──────────────────────────────────────────
+        types.Tool(
+            name="request_team_write",
+            description=(
+                "Ask a team lead to review one of your memory items before it enters "
+                "team memory, instead of sharing it directly. share_item_to_team and "
+                "share_project_to_team already queue a request automatically when a "
+                "lead has restricted your writes — call this directly when you'd "
+                "rather ask for review even without an active restriction. "
+                "Triggered by '*team request <item_id>'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "The 6-char item id to request review for"},
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": ["item_id"],
+            },
+        ),
+        # ── TEAM: list_pending_requests ───────────────────────────────────────
+        types.Tool(
+            name="list_pending_requests",
+            description=(
+                "LEAD-ONLY. Show every pending write request for the team, with a "
+                "conflict note if a request looks like it may overlap or contradict an "
+                "existing team item — surfaced so a lead never approves blind, but "
+                "never blocking the decision either way. Triggered by '*team pending'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                    "project": {"type": "string", "description": "Optional — scope to one project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── TEAM: approve_request ─────────────────────────────────────────────
+        types.Tool(
+            name="approve_request",
+            description=(
+                "LEAD-ONLY. Approve a pending write request — writes it into team "
+                "memory, attributed to whoever originally requested it, not the "
+                "approving lead. Triggered by '*team approve <request_id>'. "
+                "See list_pending_requests for ids."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string", "description": "The request id to approve"},
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                },
+                "required": ["request_id"],
+            },
+        ),
+        # ── TEAM: reject_request ──────────────────────────────────────────────
+        types.Tool(
+            name="reject_request",
+            description=(
+                "LEAD-ONLY. Reject a pending write request — it never enters team "
+                "memory. The requester can still see their own request was declined; "
+                "it never becomes visible to the rest of the team. "
+                "Triggered by '*team reject <request_id>'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string", "description": "The request id to reject"},
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                },
+                "required": ["request_id"],
+            },
+        ),
         # ── PRIMARY: recap (*recap) ───────────────────────────────────────────
         types.Tool(
             name="recap",
@@ -1076,7 +1152,7 @@ async def list_tools() -> list[types.Tool]:
 _TEAM_TOOL_NAMES = frozenset({
     "create_team", "join_team", "add_team_member", "list_team_members",
     "list_team_projects", "share_project_to_team", "share_item_to_team",
-    "get_team_memory",
+    "get_team_memory", "request_team_write",
 })
 
 
@@ -1162,6 +1238,28 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         elif name == "history":
             result = await _handle_history(
                 item_id=arguments.get("item_id"),
+                team_id=arguments.get("team_id"),
+            )
+        elif name == "request_team_write":
+            result = await _handle_request_team_write(
+                item_id=arguments["item_id"],
+                team_id=arguments.get("team_id"),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "list_pending_requests":
+            result = await _handle_list_pending_requests(
+                team_id=arguments.get("team_id"),
+                project=arguments.get("project"),
+            )
+        elif name == "approve_request":
+            result = await _handle_approve_request(
+                request_id=arguments["request_id"],
+                team_id=arguments.get("team_id"),
+            )
+        elif name == "reject_request":
+            result = await _handle_reject_request(
+                request_id=arguments["request_id"],
                 team_id=arguments.get("team_id"),
             )
         elif name == "recap":
@@ -1567,10 +1665,17 @@ async def _handle_share_project_to_team(
     if "error" in result:
         return result["message"]
     _get_usage_counter().record_team_write(tid, project)
+    shared = result.get("shared", 0)
+    queued = result.get("queued", 0)
+    parts = []
+    if shared:
+        parts.append(f"Shared {shared} item{'s' if shared != 1 else ''}")
+    if queued:
+        parts.append(f"queued {queued} item{'s' if queued != 1 else ''} for lead approval")
+    summary = " and ".join(parts) if parts else "Nothing to share"
     return (
-        f"Shared {result['shared']} item{'s' if result['shared'] != 1 else ''} "
-        f"from {profile} / {project} → team {tid}.\n\n"
-        f"Team members who recall '{project}' will now see these items labeled [team]."
+        f"{summary} from {profile} / {project} → team {tid}.\n\n"
+        f"Team members who recall '{project}' will now see approved items labeled [team]."
     )
 
 
@@ -1592,10 +1697,85 @@ async def _handle_share_item_to_team(
     result = await asyncio.to_thread(_get_team_backend().share_item, user, tid, project, item_id, item)
     if "error" in result:
         return result["message"]
+    if result.get("pending"):
+        return result["message"]
     if result.get("already_shared"):
         return f"Already shared: '{result['text']}'"
     _get_usage_counter().record_team_write(tid, project)
     return f"Shared [{result['category']}]: '{result['item']}' → team {tid} / {project}."
+
+
+async def _handle_request_team_write(
+    item_id: str,
+    team_id: str | None = None,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    tid = team_id or _current_team_id()
+    if not tid:
+        return "No team set. Use *team new <name> to create one first."
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    items = await asyncio.to_thread(store.load, user, profile, project)
+    item = next((i for i in items if i.get("id") == item_id), None)
+    if item is None:
+        return f"No item with id '{item_id}' found in personal memory."
+    result = await asyncio.to_thread(_get_team_backend().request_team_write, user, tid, project, item)
+    if "error" in result:
+        return result["message"]
+    return (
+        f"Requested review for [{item.get('category')}]: '{item.get('text', '')[:80]}' "
+        f"→ team {tid} / {project}. A lead will approve or reject it."
+    )
+
+
+async def _handle_list_pending_requests(team_id: str | None = None, project: str | None = None) -> str:
+    tid = team_id or _current_team_id()
+    if not tid:
+        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
+    result = await asyncio.to_thread(_get_team_backend().list_pending_requests, _current_user_id(), tid, project)
+    if "error" in result:
+        return result["message"]
+    requests = result["requests"]
+    if not requests:
+        return f"No pending requests for team {tid}."
+    lines = [f"Pending requests — team {tid}:"]
+    for r in requests:
+        lines.append(f"\n  [{r['id'][:8]}] {r['requested_by']} → {r['project']} / [{r['category']}]")
+        lines.append(f"    \"{r['text']}\"")
+        conflict = r.get("conflict")
+        if conflict:
+            lines.append(
+                f"    conflict: may overlap with [{conflict.get('item_id') or '??????'}] "
+                f"\"{conflict.get('text', '')}\" (by {conflict.get('shared_by', '?')}, "
+                f"similarity {conflict.get('similarity')})"
+            )
+    lines.append("")
+    lines.append("Approve with approve_request(request_id), reject with reject_request(request_id).")
+    return "\n".join(lines)
+
+
+async def _handle_approve_request(request_id: str, team_id: str | None = None) -> str:
+    tid = team_id or _current_team_id()
+    if not tid:
+        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
+    result = await asyncio.to_thread(_get_team_backend().approve_request, _current_user_id(), tid, request_id)
+    if "error" in result:
+        return result["message"]
+    _get_usage_counter().record_team_write(tid)
+    item = result.get("item") or {}
+    label = item.get("item") or item.get("text") or ""
+    return f"Approved [{request_id[:8]}]: '{label}' now in team {tid} memory."
+
+
+async def _handle_reject_request(request_id: str, team_id: str | None = None) -> str:
+    tid = team_id or _current_team_id()
+    if not tid:
+        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
+    result = await asyncio.to_thread(_get_team_backend().reject_request, _current_user_id(), tid, request_id)
+    if "error" in result:
+        return result["message"]
+    return f"Rejected [{request_id[:8]}]. It will not enter team memory."
 
 
 async def _handle_get_team_memory(

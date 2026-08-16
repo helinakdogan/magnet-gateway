@@ -155,3 +155,20 @@ class HostedRelayTeamBackend:
         # No-op for the same reason as check_memory_cap above — nothing to
         # meter locally.
         return None
+
+    # ── Write-approval flow ──────────────────────────────────────────────
+
+    def request_team_write(self, user_id: str, team_id: str, project: str, item: dict) -> dict:  # noqa: ARG002
+        return self._op("request_team_write", team_id=team_id, project=project, item=item)
+
+    def list_pending_requests(self, user_id: str, team_id: str, project: str | None = None) -> dict:  # noqa: ARG002
+        return self._op("list_pending_requests", team_id=team_id, project=project)
+
+    def approve_request(self, user_id: str, team_id: str, request_id: str) -> dict:  # noqa: ARG002
+        return self._op("approve_request", team_id=team_id, request_id=request_id)
+
+    def reject_request(self, user_id: str, team_id: str, request_id: str) -> dict:  # noqa: ARG002
+        return self._op("reject_request", team_id=team_id, request_id=request_id)
+
+    def list_my_requests(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
+        return self._op("list_my_requests", team_id=team_id)

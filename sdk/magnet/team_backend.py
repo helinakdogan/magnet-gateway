@@ -119,6 +119,46 @@ class TeamBackend(Protocol):
         fire-and-forget — must never raise."""
         ...
 
+    # ── Write-approval flow ────────────────────────────────────────────
+    #
+    # A lead can restrict a specific (member, project, category) combination
+    # so matching writes queue for review instead of landing directly in
+    # team memory — opt-in per restriction, not a per-team toggle. With no
+    # restriction covering a given write, share_item/share_project/
+    # check_auto_promote behave exactly as they did before this existed.
+
+    def request_team_write(self, user_id: str, team_id: str, project: str, item: dict) -> dict:
+        """Explicit member-facing request for review — the same outcome
+        share_item/share_project fall into automatically when a restriction
+        matches, but callable directly even without one.
+        {"request_id", "status": "pending"} or {"error", "message"}."""
+        ...
+
+    def list_pending_requests(self, user_id: str, team_id: str, project: str | None = None) -> dict:
+        """Owner/lead-only. {"requests": [{"id","project","requested_by",
+        "category","text","created_at","conflict": {...}|None}, ...]} or
+        {"error","message"}. Each request's `conflict` — the most similar
+        existing team item in the same category/project, if any — is
+        surfaced so a lead never approves blind; it never blocks the call."""
+        ...
+
+    def approve_request(self, user_id: str, team_id: str, request_id: str) -> dict:
+        """Owner/lead-only. Writes the item into team memory (reusing
+        share_item's path, attributed to the ORIGINAL requester) and marks
+        the request approved. {"ok": True, "item", "conflict"} or
+        {"error","message"}."""
+        ...
+
+    def reject_request(self, user_id: str, team_id: str, request_id: str) -> dict:
+        """Owner/lead-only. The item never enters team memory.
+        {"ok": True} or {"error","message"}."""
+        ...
+
+    def list_my_requests(self, user_id: str, team_id: str) -> dict:
+        """Any member — their own requests only (any status), never another
+        member's pending requests. {"requests": [...]}."""
+        ...
+
 
 _backend: TeamBackend | None = None
 
