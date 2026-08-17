@@ -256,6 +256,51 @@ class MemoryStore:
                 return removed
         return None
 
+    def edit_entry(
+        self,
+        user: str,
+        profile: str,
+        project: str,
+        item_id: str,
+        text: str | None = None,
+        category: str | None = None,
+    ) -> dict | None:
+        """Update an existing item's text/category in place (id, confidence,
+        created_by, etc. untouched). Returns the updated item, or None if
+        not found. A blank/whitespace-only text or an unrecognized category
+        is ignored rather than rejected — the other field can still apply."""
+        items = self.load(user, profile, project)
+        for item in items:
+            if item.get("id") == item_id:
+                if text is not None and text.strip():
+                    item["text"] = text.strip()
+                if category is not None and category in CATEGORIES:
+                    item["category"] = category
+                item["updated_by"] = user
+                item["updated_at"] = time.time()
+                self._save(user, profile, project, items)
+                return item
+        return None
+
+    def delete_project(self, user: str, profile: str, project: str) -> bool:
+        """Remove a project entirely: its stored items key AND its entry in
+        the profile's project index. Returns True if the project existed."""
+        p, pr = _n(profile), _n(project)
+        index = self._load_index(user)
+        projects = index.get(p, [])
+        if pr not in projects:
+            return False
+        index[p] = [x for x in projects if x != pr]
+        self._save_index(user, index)
+
+        key = self._key(user, profile, project)
+        if self._redis:
+            self._redis.delete(key)
+        else:
+            self._mem.pop(key, None)
+        logger.info(f"[memory_store] deleted project '{p}/{pr}' for {user}")
+        return True
+
     def mark_goal_done(self, user: str, profile: str, project: str, item_id: str) -> dict | None:
         """Mark a goal item as done. Returns updated item, or None if not found or not a goal."""
         items = self.load(user, profile, project)
