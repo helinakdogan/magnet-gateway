@@ -5,13 +5,12 @@ Memory tools for AI assistants.
 
 Mental model:
   helin (user)
-  ├── personal (profile)   →  active profile
-  │   ├── general (project)
-  │   └── kuika   (project)  →  active project
-  └── hobby (profile)
+  ├── general (project)
+  └── kuika   (project)  →  active project
 
-Active context (which profile + project to read/write) is stored in
-~/.agent-magnet/active.json and set via list_profiles / list_projects menus.
+Active context (which project to read/write) is stored in
+~/.agent-magnet/active.json and set via the list_projects menu. No profile
+concept anywhere — projects belong directly to a user.
 
 Primary tools:
   recall               — load active project memory at session start
@@ -21,12 +20,10 @@ Primary tools:
   mark_done            — mark a goal as completed instead of deleting it
   recap                — synthesized natural-language catch-up (*recap trigger)
   show_all_memory      — full dump of active project or bird's-eye across all (*memory trigger)
-  list_profiles        — TV menu: pick a profile (*profiles trigger)
   list_projects        — TV menu: pick a project (*projects trigger)
-  set_active_context   — set the active profile + project
-  get_active_context   — show which profile + project is currently active
-  create_profile       — create a new profile
-  create_project       — create a new project in a profile
+  set_active_context   — set the active project
+  get_active_context   — show which project is currently active
+  create_project       — create a new project
 
 Alias tools (backward compat — same behavior as primary):
   inject_memory        → recall
@@ -159,36 +156,35 @@ def _read_active_context() -> dict:
     return {}
 
 
-def _write_active_context(profile: str, project: str) -> None:
-    payload = json.dumps({"profile": profile, "project": project}, ensure_ascii=False)
+def _write_active_context(project: str) -> None:
+    payload = json.dumps({"project": project}, ensure_ascii=False)
     if _in_hosted_request():
         _get_backend().set(f"vmm:{_current_user_id()}:__active__", payload)
         return
     _ACTIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_FILE.write_text(
-        json.dumps({"profile": profile, "project": project}, indent=2),
+        json.dumps({"project": project}, indent=2),
         encoding="utf-8",
     )
 
 
-def _resolve_context(profile: str | None = None, project: str | None = None) -> tuple[str, str, str]:
-    """Return (user, profile, project) — fills gaps from active context."""
+def _resolve_context(project: str | None = None) -> tuple[str, str]:
+    """Return (user, project) — fills gaps from active context."""
     active = _read_active_context()
-    resolved_profile = profile or active.get("profile") or "personal"
     resolved_project = project or active.get("project") or "general"
-    return _current_user_id(), resolved_profile, resolved_project
+    return _current_user_id(), resolved_project
 
 
-def _ctx_tag(profile: str, project: str) -> str:
-    return f"({profile} / {project})"
+def _ctx_tag(project: str) -> str:
+    return f"({project})"
 
 
 _SAVE_EVERY = int(os.environ.get("MAGNET_SAVE_EVERY", "8"))
 _RHYTHM_FILE = Path.home() / ".agent-magnet" / "rhythm.json"
 
 
-def _read_rhythm(profile: str, project: str) -> dict:
-    key = f"{profile}/{project}"
+def _read_rhythm(project: str) -> dict:
+    key = project
     if _in_hosted_request():
         # Same fixed-file leak class as active.json — must be per-user in
         # hosted mode, or concurrent users' checkpoint rhythms collide.
@@ -205,13 +201,13 @@ def _read_rhythm(profile: str, project: str) -> dict:
     return {}
 
 
-def _write_rhythm(profile: str, project: str, **updates: Any) -> None:
-    key = f"{profile}/{project}"
+def _write_rhythm(project: str, **updates: Any) -> None:
+    key = project
     if _in_hosted_request():
         backend = _get_backend()
         rkey = f"vmm:{_current_user_id()}:__rhythm__:{key}"
         try:
-            data = _read_rhythm(profile, project)
+            data = _read_rhythm(project)
             data.update(updates)
             backend.set(rkey, json.dumps(data, ensure_ascii=False))
         except Exception as e:
@@ -229,7 +225,7 @@ def _write_rhythm(profile: str, project: str, **updates: Any) -> None:
 
 
 async def _extract_from_messages(
-    messages: list[dict], user: str, profile: str, project: str
+    messages: list[dict], user: str, project: str
 ) -> tuple[int, str | None]:
     """Extract project-relevant insights from a message window and save to
     MemoryStore. Returns (saved_count, cap_message) — cap_message is the
@@ -266,7 +262,7 @@ async def _extract_from_messages(
         if cap_message:
             break
         added = await asyncio.to_thread(
-            store.add_entry, user, profile, project, category, text,
+            store.add_entry, user, project, category, text,
             source_tool=source_tool, source_transport=source_transport,
         )
         if added:
@@ -351,7 +347,7 @@ def _get_memory() -> Any:
 
 
 def _get_memory_store() -> Any:
-    """MemoryStore — reads/writes vmm:{user}:{profile}:{project}."""
+    """MemoryStore — reads/writes vmm:{user}:{project}."""
     global _memory_store
     if _memory_store is None:
         from magnet.project_store import MemoryStore
@@ -432,7 +428,6 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "profile": {"type": "string", "description": "Profile name (defaults to active profile)"},
                     "project": {"type": "string", "description": "Project name (defaults to active project)"},
                 },
                 "required": [],
@@ -460,7 +455,7 @@ async def list_tools() -> list[types.Tool]:
                 "('auth refresh lives in auth.py:refresh_token; breaks if expiry changes'), not the "
                 "code itself. "
                 "Never announce that you are calling this. Saves to the ACTIVE project. "
-                "Every response confirms with (profile / project)."
+                "Every response confirms with (project)."
             ),
             inputSchema={
                 "type": "object",
@@ -490,7 +485,6 @@ async def list_tools() -> list[types.Tool]:
                         ],
                         "description": "Category that best fits what was said",
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": ["signal_type"],
@@ -507,7 +501,6 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
@@ -536,7 +529,6 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Text to search for — returns best match preview; call again with item_id to confirm",
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
@@ -565,7 +557,6 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Text to find the goal — returns match preview, call again with item_id to confirm",
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
@@ -670,7 +661,6 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
@@ -689,7 +679,6 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "item_id": {"type": "string", "description": "The 6-char item id to share"},
                     "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": ["item_id"],
@@ -749,7 +738,6 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "item_id": {"type": "string", "description": "The 6-char item id to request review for"},
                     "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": ["item_id"],
@@ -826,7 +814,6 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
@@ -841,7 +828,7 @@ async def list_tools() -> list[types.Tool]:
                 "Two modes:\n"
                 "  DEFAULT (*memory): full dump of the ACTIVE project — every category, "
                 "every item with its id, clean readable text (not JSON).\n"
-                "  ALL (*memory all): bird's-eye view across ALL profiles and projects — "
+                "  ALL (*memory all): bird's-eye view across ALL projects — "
                 "shows item counts per category so the user sees the whole memory landscape.\n"
                 "Pass show_all=true for the all-projects overview."
             ),
@@ -852,25 +839,10 @@ async def list_tools() -> list[types.Tool]:
                         "type": "boolean",
                         "description": "True for cross-project overview, False (default) for active project full dump",
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": [],
             },
-        ),
-        # ── PRIMARY: list_profiles (TV menu) ──────────────────────────────────
-        types.Tool(
-            name="list_profiles",
-            description=(
-                "TV MENU — profiles. "
-                "Trigger: user types '*profiles' OR says 'show profiles', 'switch profile', "
-                "'change profile', 'list profiles', 'my profiles'. "
-                "Returns a numbered menu. ALWAYS present it verbatim to the user and wait for "
-                "their choice. "
-                "When they pick a number or name → call set_active_context(profile=<chosen>). "
-                "When they say 'new <name>' → call create_profile(name=<name>) instead."
-            ),
-            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # ── PRIMARY: list_projects (TV menu) ──────────────────────────────────
         types.Tool(
@@ -879,69 +851,45 @@ async def list_tools() -> list[types.Tool]:
                 "TV MENU — projects. "
                 "Trigger: user types '*projects' OR says 'show projects', 'switch project', "
                 "'change project', 'list projects', 'my projects'. "
-                "Returns a numbered list of projects in the ACTIVE profile. "
+                "Returns a numbered list of every project this user has. "
                 "ALWAYS present it verbatim and wait for their choice. "
-                "When they pick → call set_active_context(profile=<active>, project=<chosen>). "
-                "When they say 'new <name>' → call create_project(profile=<active>, name=<name>)."
+                "When they pick → call set_active_context(project=<chosen>). "
+                "When they say 'new <name>' → call create_project(name=<name>)."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "profile": {"type": "string", "description": "Profile to list (defaults to active profile)"},
-                },
-                "required": [],
-            },
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # ── PRIMARY: set_active_context ───────────────────────────────────────
         types.Tool(
             name="set_active_context",
             description=(
-                "Set the active profile and/or project. Call after the user picks from a menu. "
+                "Set the active project. Call after the user picks from a menu. "
                 "Returns a confirmation string shown to the user."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "profile": {"type": "string", "description": "Profile name to activate"},
-                    "project": {"type": "string", "description": "Project name to activate (optional — set only profile if omitted)"},
+                    "project": {"type": "string", "description": "Project name to activate"},
                 },
-                "required": ["profile"],
+                "required": ["project"],
             },
         ),
         # ── PRIMARY: get_active_context ───────────────────────────────────────
         types.Tool(
             name="get_active_context",
-            description="Return which profile and project are currently active.",
+            description="Return which project is currently active.",
             inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        # ── PRIMARY: create_profile ───────────────────────────────────────────
-        types.Tool(
-            name="create_profile",
-            description=(
-                "Create a new profile and make it active. "
-                "Call when the user says 'new <name>' during list_profiles menu, "
-                "or explicitly asks to create a profile."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Profile name (e.g. 'mavimavi', 'hobby', 'company')"},
-                },
-                "required": ["name"],
-            },
         ),
         # ── PRIMARY: create_project ───────────────────────────────────────────
         types.Tool(
             name="create_project",
             description=(
-                "Create a new project under a profile and make it active. "
+                "Create a new project and make it active. "
                 "Call when the user says 'new <name>' during list_projects menu, "
                 "or explicitly asks to create a project."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "profile": {"type": "string", "description": "Profile name (defaults to active profile)"},
                     "name": {"type": "string", "description": "Project name (e.g. 'kuika', 'side-thing')"},
                 },
                 "required": ["name"],
@@ -971,7 +919,6 @@ async def list_tools() -> list[types.Tool]:
                             "required": ["role", "content"],
                         },
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": ["messages"],
@@ -984,7 +931,7 @@ async def list_tools() -> list[types.Tool]:
                 "MANUAL CUMULATIVE SAVE — triggered when user types '*save'. "
                 "Pass ALL conversation messages accumulated so far (full history, not just recent). "
                 "Saves everything to the active project and resets the rhythm counter. "
-                "Confirm to the user: 'Saved for (profile / project). N items captured.'"
+                "Confirm to the user: 'Saved for (project). N items captured.'"
             ),
             inputSchema={
                 "type": "object",
@@ -998,7 +945,6 @@ async def list_tools() -> list[types.Tool]:
                             "required": ["role", "content"],
                         },
                     },
-                    "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
                 "required": ["messages"],
@@ -1023,7 +969,6 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "user_id": {"type": "string"},
                     "project_id": {"type": "string"},
-                    "profile_id": {"type": "string"},
                     "current_message": {"type": "string"},
                 },
                 "required": [],
@@ -1038,7 +983,6 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "user_id": {"type": "string"},
                     "project_id": {"type": "string"},
-                    "profile_id": {"type": "string"},
                     "messages": {
                         "type": "array",
                         "items": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string"}}, "required": ["role", "content"]},
@@ -1078,7 +1022,6 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "user_id": {"type": "string"},
                     "project_id": {"type": "string"},
-                    "profile": {"type": "string"},
                     "project": {"type": "string"},
                     "messages": {
                         "type": "array",
@@ -1174,7 +1117,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
         if name == "recall" or name == "inject_memory":
             result = await _handle_recall(
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "remember" or name == "add_signal":
@@ -1182,26 +1124,22 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 text=arguments.get("text"),
                 messages=arguments.get("messages"),
                 signal_type=arguments.get("signal_type", "preference"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "show_project_memory" or name == "get_project_memory":
             result = await _handle_show_project_memory(
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "forget_memory":
             result = await _handle_forget_memory(
                 item_id=arguments.get("item_id"),
                 query=arguments.get("query"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "mark_done":
             result = await _handle_mark_done(
                 item_id=arguments.get("item_id"),
                 query=arguments.get("query"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "create_team":
@@ -1220,14 +1158,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         elif name == "share_project_to_team":
             result = await _handle_share_project_to_team(
                 team_id=arguments.get("team_id"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "share_item_to_team":
             result = await _handle_share_item_to_team(
                 item_id=arguments["item_id"],
                 team_id=arguments.get("team_id"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "get_team_memory":
@@ -1244,7 +1180,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = await _handle_request_team_write(
                 item_id=arguments["item_id"],
                 team_id=arguments.get("team_id"),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "list_pending_requests":
@@ -1264,43 +1199,33 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "recap":
             result = await _handle_recap(
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "show_all_memory":
             result = await _handle_show_all_memory(
                 show_all=bool(arguments.get("show_all", False)),
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
-        elif name == "list_profiles":
-            result = await _handle_list_profiles()
         elif name == "list_projects":
-            result = await _handle_list_projects(profile=arguments.get("profile"))
+            result = await _handle_list_projects()
         elif name == "set_active_context":
             result = await _handle_set_active_context(
-                profile=arguments["profile"],
-                project=arguments.get("project"),
+                project=arguments["project"],
             )
         elif name == "get_active_context":
             result = await _handle_get_active_context()
-        elif name == "create_profile":
-            result = await _handle_create_profile(name=arguments["name"])
         elif name == "create_project":
             result = await _handle_create_project(
-                profile=arguments.get("profile"),
                 name=arguments["name"],
             )
         elif name == "checkpoint":
             result = await _handle_checkpoint(
                 messages=arguments["messages"],
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "save_now":
             result = await _handle_save_now(
                 messages=arguments["messages"],
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "get_status":
@@ -1308,7 +1233,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         elif name in ("save_session", "end_session"):
             result = await _handle_save_session(
                 messages=arguments["messages"],
-                profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
         elif name == "usage_stats":
@@ -1333,8 +1257,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 # ── Primary handlers ──────────────────────────────────────────────────────────
 
-async def _handle_recall(profile: str | None = None, project: str | None = None) -> str:
-    user, profile, project = _resolve_context(profile, project)
+async def _handle_recall(project: str | None = None) -> str:
+    user, project = _resolve_context(project)
     store = _get_memory_store()
     usage = _get_usage_counter()
 
@@ -1346,23 +1270,23 @@ async def _handle_recall(profile: str | None = None, project: str | None = None)
     if team_items:
         usage.record_team_recall(team_id, project)
         body = await asyncio.to_thread(
-            store.format_merged_for_injection, user, profile, project, team_items
+            store.format_merged_for_injection, user, project, team_items
         )
     else:
-        body = await asyncio.to_thread(store.format_for_injection, user, profile, project)
+        body = await asyncio.to_thread(store.format_for_injection, user, project)
 
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
 
     if not body:
         team_note = f" (shared with team {team_id})" if team_id else ""
         return (
-            f"Fresh start — no memory yet for {profile} / {project}{team_note}. "
+            f"Fresh start — no memory yet for {project}{team_note}. "
             f"I'll remember things as we work together. {ctx}"
         )
 
     team_note = f"\n[Team context from {team_id} is included — items marked [team].]" if team_items else ""
     lines = [
-        f"You're working on {project} in {profile}. Here's what I know:",
+        f"You're working on {project}. Here's what I know:",
         "",
         body,
         "",
@@ -1375,12 +1299,11 @@ async def _handle_remember(
     signal_type: str,
     text: str | None = None,
     messages: list[dict] | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
     from magnet.local_extractor import compress_essence
 
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
     usage = _get_usage_counter()
 
@@ -1394,7 +1317,7 @@ async def _handle_remember(
         extracted = ""
 
     if not extracted:
-        return f"Nothing to save. {_ctx_tag(profile, project)}"
+        return f"Nothing to save. {_ctx_tag(project)}"
 
     # Essence compression is a backstop here, not the primary mechanism —
     # the tool description already instructs the calling model to write
@@ -1403,18 +1326,18 @@ async def _handle_remember(
 
     cap_msg = await _memory_cap_check(user)
     if cap_msg:
-        return f"{cap_msg} {_ctx_tag(profile, project)}"
+        return f"{cap_msg} {_ctx_tag(project)}"
 
     category = _SIGNAL_TO_CATEGORY.get(signal_type, "preference")
     saved = await asyncio.to_thread(
-        store.add_entry, user, profile, project, category, extracted,
+        store.add_entry, user, project, category, extracted,
         source_tool=_current_source_tool(), source_transport=_current_source_transport(),
     )
     if saved:
         await _record_memory_delta(user, 1)
     usage.record_write(project)
 
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
     preview = extracted[:80] + ("…" if len(extracted) > 80 else "")
 
     auto_promoted = False
@@ -1429,7 +1352,7 @@ async def _handle_remember(
         # here silently skips promotion, it must never fail the remember
         # call itself, so this stays inside a broad try/except.
         try:
-            items = await asyncio.to_thread(store.load, user, profile, project)
+            items = await asyncio.to_thread(store.load, user, project)
             new_item = items[-1] if items else None
             if new_item:
                 auto_promoted = await asyncio.to_thread(
@@ -1447,36 +1370,35 @@ async def _handle_remember(
     return f"Already known (skipped duplicate): \"{preview[:60]}\" {ctx}"
 
 
-async def _handle_show_project_memory(profile: str | None = None, project: str | None = None) -> str:
-    user, profile, project = _resolve_context(profile, project)
+async def _handle_show_project_memory(project: str | None = None) -> str:
+    user, project = _resolve_context(project)
     store = _get_memory_store()
     team_items = await _load_team_items_if_shared(project, _current_team_id())
     if team_items:
-        return await asyncio.to_thread(store.format_merged_for_display, user, profile, project, team_items)
-    return await asyncio.to_thread(store.format_for_display, user, profile, project)
+        return await asyncio.to_thread(store.format_merged_for_display, user, project, team_items)
+    return await asyncio.to_thread(store.format_for_display, user, project)
 
 
 async def _handle_forget_memory(
     item_id: str | None = None,
     query: str | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
 
     if item_id:
-        removed = await asyncio.to_thread(store.delete_entry, user, profile, project, item_id)
+        removed = await asyncio.to_thread(store.delete_entry, user, project, item_id)
         if removed:
             await _record_memory_delta(user, -1)
             return f"Forgot: '{removed['text'][:80]}' from {removed['category']}. {ctx}"
-        return f"No item with id '{item_id}' found in {profile} / {project}."
+        return f"No item with id '{item_id}' found in {project}."
 
     if query:
-        items = await asyncio.to_thread(store.load, user, profile, project)
+        items = await asyncio.to_thread(store.load, user, project)
         if not items:
-            return f"No memories in {profile} / {project} to search. {ctx}"
+            return f"No memories in {project} to search. {ctx}"
         from magnet.local_embeddings import rank_by_similarity
         matches = await asyncio.to_thread(rank_by_similarity, query, items, "text", 3)
         if not matches:
@@ -1500,24 +1422,23 @@ async def _handle_forget_memory(
 async def _handle_mark_done(
     item_id: str | None = None,
     query: str | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
 
     if item_id:
-        updated = await asyncio.to_thread(store.mark_goal_done, user, profile, project, item_id)
+        updated = await asyncio.to_thread(store.mark_goal_done, user, project, item_id)
         if updated:
             return f"Goal marked done: '{updated['text'][:80]}'. {ctx}"
         return f"No goal with id '{item_id}' found (or it's not a goal). {ctx}"
 
     if query:
-        items = await asyncio.to_thread(store.load, user, profile, project)
+        items = await asyncio.to_thread(store.load, user, project)
         goals = [i for i in items if i.get("category") == "goal"]
         if not goals:
-            return f"No goals in {profile} / {project}. {ctx}"
+            return f"No goals in {project}. {ctx}"
         from magnet.local_embeddings import rank_by_similarity
         matches = await asyncio.to_thread(rank_by_similarity, query, goals, "text", 1)
         if not matches:
@@ -1618,7 +1539,7 @@ async def _handle_list_team_members(team_id: str | None = None) -> str:
     members = result["members"]
     lines = [f"Team: {team.get('name', tid)} ({tid})", ""]
     for m in members:
-        role_tag = " (owner)" if m["role"] == "owner" else ""
+        role_tag = " (lead)" if m["role"] == "lead" else ""
         lines.append(f"  · {m['user_id']}{role_tag}")
     lines += ["", f"Total: {len(members)} member{'s' if len(members) != 1 else ''}"]
     return "\n".join(lines)
@@ -1650,17 +1571,16 @@ async def _handle_list_team_projects(team_id: str | None = None) -> str:
 
 async def _handle_share_project_to_team(
     team_id: str | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, profile, project)
+    items = await asyncio.to_thread(store.load, user, project)
     if not items:
-        return f"No memory in {profile} / {project} to share yet."
+        return f"No memory in {project} to share yet."
     result = await asyncio.to_thread(_get_team_backend().share_project, user, tid, project, items)
     if "error" in result:
         return result["message"]
@@ -1674,7 +1594,7 @@ async def _handle_share_project_to_team(
         parts.append(f"queued {queued} item{'s' if queued != 1 else ''} for lead approval")
     summary = " and ".join(parts) if parts else "Nothing to share"
     return (
-        f"{summary} from {profile} / {project} → team {tid}.\n\n"
+        f"{summary} from {project} → team {tid}.\n\n"
         f"Team members who recall '{project}' will now see approved items labeled [team]."
     )
 
@@ -1682,15 +1602,14 @@ async def _handle_share_project_to_team(
 async def _handle_share_item_to_team(
     item_id: str,
     team_id: str | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, profile, project)
+    items = await asyncio.to_thread(store.load, user, project)
     item = next((i for i in items if i.get("id") == item_id), None)
     if item is None:
         return f"No item with id '{item_id}' found in personal memory."
@@ -1708,15 +1627,14 @@ async def _handle_share_item_to_team(
 async def _handle_request_team_write(
     item_id: str,
     team_id: str | None = None,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, profile, project)
+    items = await asyncio.to_thread(store.load, user, project)
     item = next((i for i in items if i.get("id") == item_id), None)
     if item is None:
         return f"No item with id '{item_id}' found in personal memory."
@@ -1786,7 +1704,7 @@ async def _handle_get_team_memory(
     if not tid:
         return "No team set. Use *team new <name> to create one first."
     explicit_project = project is not None
-    _, profile, resolved_project = _resolve_context(None, project)
+    _, resolved_project = _resolve_context(project)
 
     result = await asyncio.to_thread(
         _get_team_backend().get_team_memory, _current_user_id(), tid, resolved_project, explicit_project
@@ -1799,7 +1717,7 @@ async def _handle_get_team_memory(
             # Local active project pointed somewhere the team never shared —
             # the backend found the one project that IS shared; switching the
             # local active context to it is purely local state, done here.
-            _write_active_context(profile, auto_selected)
+            _write_active_context(auto_selected)
         return result["display_text"]
     if result.get("ambiguous"):
         return _format_shared_projects_menu(tid, result["shared_projects"])
@@ -1839,7 +1757,7 @@ async def _handle_history(
     return "\n".join(lines)
 
 
-def _recap_template(project: str, profile: str, by_cat: dict) -> str:
+def _recap_template(project: str, by_cat: dict) -> str:
     """Template-based recap when no LLM key is available."""
     actions      = [t for t, _ in by_cat.get("action", [])]
     active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
@@ -1884,7 +1802,7 @@ def _recap_template(project: str, profile: str, by_cat: dict) -> str:
     return " ".join(parts)
 
 
-async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: str) -> str:
+async def _recap_with_llm(project: str, by_cat: dict, openai_key: str) -> str:
     """LLM-synthesized recap — natural prose, like a teammate catching you up."""
     import litellm
 
@@ -1933,13 +1851,13 @@ async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: 
     except Exception as e:
         logger.warning(f"[recap] LLM failed ({e}), falling back to template")
 
-    return _recap_template(project, profile, by_cat)
+    return _recap_template(project, by_cat)
 
 
-async def _handle_recap(profile: str | None = None, project: str | None = None) -> str:
-    user, profile, project = _resolve_context(profile, project)
+async def _handle_recap(project: str | None = None) -> str:
+    user, project = _resolve_context(project)
     store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, profile, project)
+    items = await asyncio.to_thread(store.load, user, project)
 
     # Merge team items (labeled differently in recap)
     team_items = await _load_team_items_if_shared(project, _current_team_id())
@@ -1950,7 +1868,7 @@ async def _handle_recap(profile: str | None = None, project: str | None = None) 
 
     if not items:
         return (
-            f"No memory yet for {profile} / {project} — fresh start. "
+            f"No memory yet for {project} — fresh start. "
             "What are we working on?"
         )
 
@@ -1966,22 +1884,21 @@ async def _handle_recap(profile: str | None = None, project: str | None = None) 
 
     openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
     if openai_key:
-        return await _recap_with_llm(project, profile, by_cat, openai_key)
-    return _recap_template(project, profile, by_cat)
+        return await _recap_with_llm(project, by_cat, openai_key)
+    return _recap_template(project, by_cat)
 
 
 async def _handle_show_all_memory(
     show_all: bool = False,
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
     user = _current_user_id()
     store = _get_memory_store()
 
     if show_all:
-        profiles = await asyncio.to_thread(store.list_profiles, user)
-        if not profiles:
-            return "No memory yet. Say *profiles to create your first profile."
+        projects = await asyncio.to_thread(store.list_projects, user)
+        if not projects:
+            return "No memory yet. Say *projects to create your first project."
 
         _cat_labels = {
             "action": "action", "decision": "decision", "goal": "goal", "watch_out": "watch-out",
@@ -1989,63 +1906,38 @@ async def _handle_show_all_memory(
             "preference": "preference",
         }
         lines = ["Your memory — all projects:\n"]
-        for prof_name, _ in profiles:
-            projects = await asyncio.to_thread(store.list_projects, user, prof_name)
-            if not projects:
+        for proj_name in projects:
+            proj_items = await asyncio.to_thread(store.load, user, proj_name)
+            if not proj_items:
+                lines.append(f"  {proj_name} — (empty)")
                 continue
-            lines.append(f"  {prof_name}:")
-            for proj_name in projects:
-                proj_items = await asyncio.to_thread(store.load, user, prof_name, proj_name)
-                if not proj_items:
-                    lines.append(f"    {proj_name} — (empty)")
-                    continue
-                counts: dict[str, int] = {}
-                for it in proj_items:
-                    c = it.get("category", "preference")
-                    counts[c] = counts.get(c, 0) + 1
-                parts = []
-                for cat in ["action", "decision", "goal", "watch_out", "tried_failed", "convention", "preference"]:
-                    n = counts.get(cat, 0)
-                    if n:
-                        lbl = _cat_labels[cat]
-                        parts.append(f"{n} {lbl}{'s' if n != 1 else ''}")
-                lines.append(f"    {proj_name} — {', '.join(parts) if parts else 'empty'}")
-            lines.append("")
+            counts: dict[str, int] = {}
+            for it in proj_items:
+                c = it.get("category", "preference")
+                counts[c] = counts.get(c, 0) + 1
+            parts = []
+            for cat in ["action", "decision", "goal", "watch_out", "tried_failed", "convention", "preference"]:
+                n = counts.get(cat, 0)
+                if n:
+                    lbl = _cat_labels[cat]
+                    parts.append(f"{n} {lbl}{'s' if n != 1 else ''}")
+            lines.append(f"  {proj_name} — {', '.join(parts) if parts else 'empty'}")
 
+        lines.append("")
         lines.append("Say *memory to see any project in full, or *projects to switch.")
         return "\n".join(lines)
 
     # Default: full dump of active project
-    user, profile, project = _resolve_context(profile, project)
-    return await asyncio.to_thread(store.format_for_display, user, profile, project)
+    user, project = _resolve_context(project)
+    return await asyncio.to_thread(store.format_for_display, user, project)
 
 
-async def _handle_list_profiles() -> str:
-    user = _current_user_id()
+async def _handle_list_projects() -> str:
+    user, _ = _resolve_context(None)
     store = _get_memory_store()
-    profiles = await asyncio.to_thread(store.list_profiles, user)
+    projects = await asyncio.to_thread(store.list_projects, user)
 
-    if not profiles:
-        return (
-            "No profiles yet.\n"
-            "Say 'new <name>' to create your first profile (e.g. 'new personal')."
-        )
-
-    lines = ["Your profiles:"]
-    for i, (name, count) in enumerate(profiles, 1):
-        suffix = f"({count} project{'s' if count != 1 else ''})"
-        lines.append(f"  {i}. {name}   {suffix}")
-    lines.append("")
-    lines.append("Which one? (type a number or name) — or say 'new <name>' to create one.")
-    return "\n".join(lines)
-
-
-async def _handle_list_projects(profile: str | None = None) -> str:
-    user, profile, _ = _resolve_context(profile, None)
-    store = _get_memory_store()
-    projects = await asyncio.to_thread(store.list_projects, user, profile)
-
-    lines = [f"Projects in {profile}:"]
+    lines = ["Your projects:"]
     if projects:
         for i, name in enumerate(projects, 1):
             lines.append(f"  {i}. {name}")
@@ -2057,81 +1949,50 @@ async def _handle_list_projects(profile: str | None = None) -> str:
     return "\n".join(lines)
 
 
-async def _handle_set_active_context(profile: str, project: str | None = None) -> str:
+async def _handle_set_active_context(project: str) -> str:
     user = _current_user_id()
     store = _get_memory_store()
 
-    # Ensure profile exists
-    await asyncio.to_thread(store.create_profile, user, profile)
-
-    active = _read_active_context()
-    current_project = project or active.get("project") or "general"
-
-    if project:
-        await asyncio.to_thread(store.create_project, user, profile, project)
-        _write_active_context(profile, project)
-        return (
-            f"Active: {profile} / {project}. "
-            "I'll remember everything here now."
-        )
-    else:
-        _write_active_context(profile, current_project)
-        return (
-            f"Active profile: {profile}. "
-            "Say *projects to pick a project."
-        )
-
-
-async def _handle_get_active_context() -> str:
-    _, profile, project = _resolve_context()
-    return f"Active: {profile} / {project}"
-
-
-async def _handle_create_profile(name: str) -> str:
-    user = _current_user_id()
-    store = _get_memory_store()
-    created = await asyncio.to_thread(store.create_profile, user, name)
-    active = _read_active_context()
-    _write_active_context(name, active.get("project") or "general")
-    if created:
-        return (
-            f"Profile '{name}' created and set as active. "
-            "Say *projects to add a project."
-        )
+    await asyncio.to_thread(store.create_project, user, project)
+    _write_active_context(project)
     return (
-        f"Profile '{name}' already exists — switching to it. "
-        "Say *projects to pick a project."
+        f"Active: {project}. "
+        "I'll remember everything here now."
     )
 
 
-async def _handle_create_project(name: str, profile: str | None = None) -> str:
-    user, profile, _ = _resolve_context(profile, None)
+async def _handle_get_active_context() -> str:
+    _, project = _resolve_context()
+    return f"Active: {project}"
+
+
+async def _handle_create_project(name: str) -> str:
+    user, _ = _resolve_context(None)
     store = _get_memory_store()
-    created = await asyncio.to_thread(store.create_project, user, profile, name)
-    _write_active_context(profile, name)
+    created = await asyncio.to_thread(store.create_project, user, name)
+    _write_active_context(name)
     if created:
-        return f"Project '{name}' created in {profile}. Active: {profile} / {name}."
-    return f"Project '{name}' already exists in {profile}. Switched to {profile} / {name}."
+        return f"Project '{name}' created. Active: {name}."
+    return f"Project '{name}' already exists. Switched to {name}."
 
 
 # ── Rhythm / checkpoint handlers ──────────────────────────────────────────────
 
 async def _handle_checkpoint(
     messages: list[dict],
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    user, profile, project = _resolve_context(profile, project)
-    saved, cap_message = await _extract_from_messages(messages, user, profile, project)
+    user, project = _resolve_context(project)
+    saved, cap_message = await _extract_from_messages(messages, user, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
-        profile, project,
+        project,
         last_checkpoint_at=time.time(),
         last_messages_in_window=len([m for m in messages if m.get("role") == "user"]),
-        total_checkpoints=(_read_rhythm(profile, project).get("total_checkpoints", 0) + 1),
+        total_checkpoints=(_read_rhythm(project).get("total_checkpoints", 0) + 1),
         last_items_saved=saved,
     )
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
     cap_note = f" {cap_message}" if cap_message else ""
     if saved:
         return f"Checkpoint — {saved} item{'s' if saved != 1 else ''} saved.{cap_note} {ctx}"
@@ -2140,22 +2001,21 @@ async def _handle_checkpoint(
 
 async def _handle_save_now(
     messages: list[dict],
-    profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    user, profile, project = _resolve_context(profile, project)
-    saved, cap_message = await _extract_from_messages(messages, user, profile, project)
+    user, project = _resolve_context(project)
+    saved, cap_message = await _extract_from_messages(messages, user, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
-        profile, project,
+        project,
         last_checkpoint_at=time.time(),
         last_messages_in_window=len([m for m in messages if m.get("role") == "user"]),
-        total_checkpoints=(_read_rhythm(profile, project).get("total_checkpoints", 0) + 1),
+        total_checkpoints=(_read_rhythm(project).get("total_checkpoints", 0) + 1),
         last_items_saved=saved,
     )
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
     store = _get_memory_store()
-    total = len(await asyncio.to_thread(store.load, user, profile, project))
+    total = len(await asyncio.to_thread(store.load, user, project))
     cap_note = f" {cap_message}" if cap_message else ""
     return (
         f"Saved everything up to here for {ctx}. "
@@ -2165,7 +2025,7 @@ async def _handle_save_now(
 
 
 async def _handle_get_status() -> str:
-    user, profile, project = _resolve_context()
+    user, project = _resolve_context()
     store = _get_memory_store()
     usage = _get_usage_counter()
     backend = _get_backend()
@@ -2191,7 +2051,7 @@ async def _handle_get_status() -> str:
         plan_line = "Free — local storage, unlimited"
 
     # Memory counts
-    items = await asyncio.to_thread(store.load, user, profile, project)
+    items = await asyncio.to_thread(store.load, user, project)
     total_memories = len(items)
 
     # Usage stats
@@ -2200,7 +2060,7 @@ async def _handle_get_status() -> str:
     total_retrievals = stats.get("retrievals:total", 0)
 
     # Rhythm info
-    rhythm = _read_rhythm(profile, project)
+    rhythm = _read_rhythm(project)
     last_cp = rhythm.get("last_checkpoint_at")
     total_cps = rhythm.get("total_checkpoints", 0)
     last_items = rhythm.get("last_items_saved", 0)
@@ -2237,7 +2097,7 @@ async def _handle_get_status() -> str:
             team_line = f"{_current_team_id()} (error checking team status: {e})"
 
     lines = [
-        f"Active:          {profile} / {project}",
+        f"Active:          {project}",
         f"Team:            {team_line}",
         f"Storage:         {storage_line}",
         f"Save rhythm:     every ~{_SAVE_EVERY} user messages",
@@ -2262,31 +2122,32 @@ async def _handle_get_status() -> str:
 
 async def _handle_save_session(
     messages: list[dict],
-    profile: str | None = None,
     project: str | None = None,
 ) -> dict:
-    user, profile, project = _resolve_context(profile, project)
+    user, project = _resolve_context(project)
     memory = _get_memory()
     store = _get_memory_store()
     usage = _get_usage_counter()
 
-    # Use active profile/project as the "project_id" for legacy session_end
+    # BehavioralMemory.session_end's profile_id param is the unrelated
+    # Layer-1 preference-profile concept (client.py), not touched by this
+    # module — omitted, defaults to None.
     result = await asyncio.to_thread(
-        memory.session_end, user, project, messages, 20, profile
+        memory.session_end, user, project, messages, 20
     )
 
     # Promote concrete decisions/watch-outs into the new MemoryStore
     summary = result.get("summary", "")
     if summary:
-        await _promote_summary_to_memory(summary, user, profile, project, store)
+        await _promote_summary_to_memory(summary, user, project, store)
 
     usage.record_write(project)
-    ctx = _ctx_tag(profile, project)
+    ctx = _ctx_tag(project)
     return {**result, "active_context": ctx}
 
 
 async def _promote_summary_to_memory(
-    summary: str, user: str, profile: str, project: str, store: Any
+    summary: str, user: str, project: str, store: Any
 ) -> None:
     from magnet.local_extractor import detect_category, compress_essence
 
@@ -2304,7 +2165,7 @@ async def _promote_summary_to_memory(
             text = compress_essence(text)
             try:
                 added = await asyncio.to_thread(
-                    store.add_entry, user, profile, project, cat, text,
+                    store.add_entry, user, project, cat, text,
                     source_tool=source_tool, source_transport=source_transport,
                 )
                 if added:
@@ -2316,11 +2177,11 @@ async def _promote_summary_to_memory(
 # ── Usage handler ─────────────────────────────────────────────────────────────
 
 async def _handle_usage_stats() -> dict:
-    _, profile, project = _resolve_context()
+    _, project = _resolve_context()
     stats = _get_usage_counter().get_stats()
     return {
         "user": _current_user_id(),
-        "active_context": _ctx_tag(profile, project),
+        "active_context": _ctx_tag(project),
         "stats": stats,
         "note": "Metering active. Local mode is unlimited.",
     }
@@ -2359,7 +2220,6 @@ async def list_prompts() -> list[types.Prompt]:
             name="load-memory",
             description="Load your memory for the active project into this conversation",
             arguments=[
-                types.PromptArgument(name="profile", description="Profile name", required=False),
                 types.PromptArgument(name="project", description="Project name", required=False),
             ],
         )
@@ -2372,7 +2232,6 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
         raise ValueError(f"Unknown prompt: {name}")
     arguments = arguments or {}
     injection = await _handle_recall(
-        profile=arguments.get("profile"),
         project=arguments.get("project"),
     )
     return types.GetPromptResult(

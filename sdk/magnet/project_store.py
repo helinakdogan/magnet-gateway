@@ -1,21 +1,26 @@
 """
 MemoryStore
 -----------
-Stores project memory under a clean three-level hierarchy:
+Stores project memory under a flat two-level hierarchy — no profile
+concept: user -> project.
 
   helin (user)
-  ├── personal (profile)
-  │   ├── general (project)  →  key: vmm:helin:personal:general
-  │   └── kuika   (project)  →  key: vmm:helin:personal:kuika
-  └── hobby (profile)
-      └── side-thing         →  key: vmm:helin:hobby:side-thing
+  ├── general   (project)  →  key: vmm:helin:general
+  └── kuika     (project)  →  key: vmm:helin:kuika
 
-Key format:   vmm:{user}:{profile}:{project}
+Key format:   vmm:{user}:{project}
 Value:        JSON {"items": [{id, category, text, status, confidence, stored_at,
               source_tool, source_transport, created_by, updated_by, updated_at}]}
 
 Index key:    vmm:{user}:__index__
-Value:        JSON {"personal": ["general", "kuika"], "hobby": ["side-thing"]}
+Value:        JSON ["general", "kuika"]
+
+Legacy migration: this used to be a 3-level hierarchy (user -> profile ->
+project, key vmm:{user}:{profile}:{project}, index a {profile: [project,
+...]} dict). _load_index transparently migrates any user still on that old
+shape the first time it's read — see _migrate_legacy. Same-named projects
+that existed under different former profiles are merged (items
+concatenated, de-duplicated by id).
 
 ProjectStore is an alias for backward compat with existing imports.
 """
@@ -105,66 +110,107 @@ class MemoryStore:
 
     # ── Key helpers ──────────────────────────────────────────────────────────────
 
-    def _key(self, user: str, profile: str, project: str) -> str:
-        return f"vmm:{_n(user)}:{_n(profile)}:{_n(project)}"
+    def _key(self, user: str, project: str) -> str:
+        return f"vmm:{_n(user)}:{_n(project)}"
 
     def _index_key(self, user: str) -> str:
         return f"vmm:{_n(user)}:__index__"
 
-    # ── Profile / project index ───────────────────────────────────────────────────
+    def _legacy_key(self, user: str, profile: str, project: str) -> str:
+        return f"vmm:{_n(user)}:{_n(profile)}:{_n(project)}"
 
-    def _load_index(self, user: str) -> dict[str, list[str]]:
-        key = self._index_key(user)
+    # ── Project index (+ legacy profile migration) ────────────────────────────────
+
+    def _raw_get(self, key: str) -> str | None:
         if self._redis:
-            raw = self._redis.get(key)
-            return json.loads(raw) if raw else {}
-        return dict(self._mem.get(key, {}))
+            return self._redis.get(key)
+        stored = self._mem.get(key)
+        return json.dumps(stored, ensure_ascii=False) if stored is not None else None
 
-    def _save_index(self, user: str, index: dict[str, list[str]]) -> None:
+    def _raw_delete(self, key: str) -> None:
+        if self._redis:
+            self._redis.delete(key)
+        else:
+            self._mem.pop(key, None)
+
+    def _migrate_legacy(self, user: str, legacy_index: dict) -> list[str]:
+        """One-time, idempotent migration off the old profile-scoped format
+        (vmm:{user}:{profile}:{project}, index a {profile: [project, ...]}
+        dict) into the new flat vmm:{user}:{project} format. Same-named
+        projects that existed under different former profiles are merged:
+        items concatenated, then de-duplicated by id (first occurrence
+        wins). Deletes the old per-profile keys once merged."""
+        projects: list[str] = []
+        for profile, plist in legacy_index.items():
+            if not isinstance(plist, list):
+                continue
+            for project in plist:
+                pr = _n(project)
+                old_key = self._legacy_key(user, profile, project)
+                old_raw = self._raw_get(old_key)
+                old_items: list[dict] = []
+                if old_raw:
+                    data = json.loads(old_raw)
+                    old_items = data.get("items", []) if isinstance(data, dict) else data
+
+                existing = self.load(user, pr) if pr in projects else []
+                seen = {i.get("id") for i in existing if i.get("id")}
+                merged = list(existing)
+                for it in old_items:
+                    iid = it.get("id")
+                    if iid and iid in seen:
+                        continue
+                    if iid:
+                        seen.add(iid)
+                    merged.append(it)
+
+                self._save(user, pr, merged)
+                self._raw_delete(old_key)
+                if pr not in projects:
+                    projects.append(pr)
+
+        self._raw_delete(self._index_key(user))
+        self._save_index(user, projects)
+        logger.info(f"[memory_store] migrated {len(projects)} project(s) off legacy profile format for {user}")
+        return projects
+
+    def _load_index(self, user: str) -> list[str]:
+        raw = self._raw_get(self._index_key(user))
+        if not raw:
+            return []
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            # Legacy {profile: [project, ...]} shape — migrate transparently.
+            return self._migrate_legacy(user, data)
+        return list(data)
+
+    def _save_index(self, user: str, projects: list[str]) -> None:
         key = self._index_key(user)
-        data = json.dumps(index, ensure_ascii=False)
+        data = json.dumps(projects, ensure_ascii=False)
         if self._redis:
             self._redis.set(key, data)
         else:
-            self._mem[key] = dict(index)
+            self._mem[key] = list(projects)
 
-    def create_profile(self, user: str, name: str) -> bool:
-        """Add a profile. Returns True if newly created."""
-        p = _n(name)
-        index = self._load_index(user)
-        if p in index:
-            return False
-        index[p] = []
-        self._save_index(user, index)
-        logger.info(f"[memory_store] created profile '{p}' for {user}")
-        return True
-
-    def create_project(self, user: str, profile: str, name: str) -> bool:
-        """Add a project under a profile. Creates profile if absent. Returns True if newly created."""
-        p, pr = _n(profile), _n(name)
-        index = self._load_index(user)
-        projects = index.setdefault(p, [])
+    def create_project(self, user: str, name: str) -> bool:
+        """Add a project. Returns True if newly created."""
+        pr = _n(name)
+        projects = self._load_index(user)
         if pr in projects:
             return False
         projects.append(pr)
-        self._save_index(user, index)
-        logger.info(f"[memory_store] created project '{p}/{pr}' for {user}")
+        self._save_index(user, projects)
+        logger.info(f"[memory_store] created project '{pr}' for {user}")
         return True
 
-    def list_profiles(self, user: str) -> list[tuple[str, int]]:
-        """Return [(profile_name, project_count)] sorted alphabetically."""
-        index = self._load_index(user)
-        return sorted((p, len(pjs)) for p, pjs in index.items())
-
-    def list_projects(self, user: str, profile: str) -> list[str]:
-        """Return project names in a profile, in insertion order."""
-        index = self._load_index(user)
-        return list(index.get(_n(profile), []))
+    def list_projects(self, user: str) -> list[str]:
+        """Return project names, in insertion order."""
+        return self._load_index(user)
 
     # ── Memory entries ───────────────────────────────────────────────────────────
 
-    def load(self, user: str, profile: str, project: str) -> list[dict]:
-        key = self._key(user, profile, project)
+    def load(self, user: str, project: str) -> list[dict]:
+        key = self._key(user, project)
         if self._redis:
             raw = self._redis.get(key)
             if not raw:
@@ -177,11 +223,11 @@ class MemoryStore:
 
         # Lazily migrate old items that predate id/status fields
         if _add_missing_fields(items):
-            self._save(user, profile, project, items)
+            self._save(user, project, items)
         return items
 
-    def _save(self, user: str, profile: str, project: str, items: list[dict]) -> None:
-        key = self._key(user, profile, project)
+    def _save(self, user: str, project: str, items: list[dict]) -> None:
+        key = self._key(user, project)
         trimmed = items[-_MAX_ENTRIES:]
         payload = json.dumps({"items": trimmed}, ensure_ascii=False)
         if self._redis:
@@ -192,7 +238,6 @@ class MemoryStore:
     def add_entry(
         self,
         user: str,
-        profile: str,
         project: str,
         category: str,
         text: str,
@@ -213,10 +258,10 @@ class MemoryStore:
         if category not in CATEGORIES:
             category = "preference"
 
-        # Ensure profile+project exist in the index
-        self.create_project(user, profile, project)
+        # Ensure the project exists in the index
+        self.create_project(user, project)
 
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
 
         if dedup:
             try:
@@ -242,24 +287,23 @@ class MemoryStore:
             "updated_by": user,
             "updated_at": now,
         })
-        self._save(user, profile, project, items)
-        logger.info(f"[memory_store] [{category}] saved for {user}/{profile}/{project}")
+        self._save(user, project, items)
+        logger.info(f"[memory_store] [{category}] saved for {user}/{project}")
         return True
 
-    def delete_entry(self, user: str, profile: str, project: str, item_id: str) -> dict | None:
+    def delete_entry(self, user: str, project: str, item_id: str) -> dict | None:
         """Delete a memory item by id. Returns the removed item, or None if not found."""
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
         for i, item in enumerate(items):
             if item.get("id") == item_id:
                 removed = items.pop(i)
-                self._save(user, profile, project, items)
+                self._save(user, project, items)
                 return removed
         return None
 
     def edit_entry(
         self,
         user: str,
-        profile: str,
         project: str,
         item_id: str,
         text: str | None = None,
@@ -269,7 +313,7 @@ class MemoryStore:
         created_by, etc. untouched). Returns the updated item, or None if
         not found. A blank/whitespace-only text or an unrecognized category
         is ignored rather than rejected — the other field can still apply."""
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
         for item in items:
             if item.get("id") == item_id:
                 if text is not None and text.strip():
@@ -278,32 +322,25 @@ class MemoryStore:
                     item["category"] = category
                 item["updated_by"] = user
                 item["updated_at"] = time.time()
-                self._save(user, profile, project, items)
+                self._save(user, project, items)
                 return item
         return None
 
-    def delete_project(self, user: str, profile: str, project: str) -> bool:
+    def delete_project(self, user: str, project: str) -> bool:
         """Remove a project entirely: its stored items key AND its entry in
-        the profile's project index. Returns True if the project existed."""
-        p, pr = _n(profile), _n(project)
-        index = self._load_index(user)
-        projects = index.get(p, [])
+        the user's project index. Returns True if the project existed."""
+        pr = _n(project)
+        projects = self._load_index(user)
         if pr not in projects:
             return False
-        index[p] = [x for x in projects if x != pr]
-        self._save_index(user, index)
-
-        key = self._key(user, profile, project)
-        if self._redis:
-            self._redis.delete(key)
-        else:
-            self._mem.pop(key, None)
-        logger.info(f"[memory_store] deleted project '{p}/{pr}' for {user}")
+        self._save_index(user, [x for x in projects if x != pr])
+        self._raw_delete(self._key(user, project))
+        logger.info(f"[memory_store] deleted project '{pr}' for {user}")
         return True
 
-    def mark_goal_done(self, user: str, profile: str, project: str, item_id: str) -> dict | None:
+    def mark_goal_done(self, user: str, project: str, item_id: str) -> dict | None:
         """Mark a goal item as done. Returns updated item, or None if not found or not a goal."""
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
         for item in items:
             if item.get("id") == item_id:
                 if item.get("category") != "goal":
@@ -311,7 +348,7 @@ class MemoryStore:
                 item["status"] = "done"
                 item["updated_by"] = user
                 item["updated_at"] = time.time()
-                self._save(user, profile, project, items)
+                self._save(user, project, items)
                 return item
         return None
 
@@ -337,9 +374,9 @@ class MemoryStore:
 
     # ── Format helpers ───────────────────────────────────────────────────────────
 
-    def format_for_injection(self, user: str, profile: str, project: str) -> str:
+    def format_for_injection(self, user: str, project: str) -> str:
         """Compact string for system-prompt injection. Omits done goals."""
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
         active = [i for i in items if i.get("status", "active") != "done"]
         if not active:
             return ""
@@ -354,14 +391,14 @@ class MemoryStore:
         return "\n".join(lines)
 
     def format_merged_for_injection(
-        self, user: str, profile: str, project: str, team_items: list[dict]
+        self, user: str, project: str, team_items: list[dict]
     ) -> str:
         """
         Merge personal + team items for system-prompt injection.
         Personal items take precedence; team items are deduplicated and labeled [team].
         Done goals are omitted.
         """
-        personal = self.load(user, profile, project)
+        personal = self.load(user, project)
         active_personal = [i for i in personal if i.get("status", "active") != "done"]
         personal_texts = {i.get("text", "").lower() for i in active_personal}
 
@@ -394,13 +431,13 @@ class MemoryStore:
         return "\n".join(lines)
 
     def format_merged_for_display(
-        self, user: str, profile: str, project: str, team_items: list[dict]
+        self, user: str, project: str, team_items: list[dict]
     ) -> str:
         """
         Human-readable merged display. Team items labeled [team].
         Personal items take precedence; team-only items added below.
         """
-        personal = self.load(user, profile, project)
+        personal = self.load(user, project)
         personal_texts = {i.get("text", "").lower() for i in personal}
 
         all_items = list(personal)
@@ -409,7 +446,7 @@ class MemoryStore:
                 all_items.append({**ti, "_team": True})
 
         if not all_items:
-            return f"No memory yet in {profile} / {project}."
+            return f"No memory yet in {project}."
 
         by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
         for e in all_items:
@@ -417,7 +454,7 @@ class MemoryStore:
             if c in by_cat:
                 by_cat[c].append(e)
 
-        lines = [f"Memory — {profile} / {project} (with team):"]
+        lines = [f"Memory — {project} (with team):"]
         for cat in _DISPLAY_ORDER:
             lines.append(f"\n  {_LABELS[cat]}:")
             xs = by_cat.get(cat, [])
@@ -437,13 +474,13 @@ class MemoryStore:
                 lines.append("    (none)")
         return "\n".join(lines)
 
-    def format_for_display(self, user: str, profile: str, project: str) -> str:
+    def format_for_display(self, user: str, project: str) -> str:
         """Human-readable display with item IDs. Goals show status."""
-        items = self.load(user, profile, project)
+        items = self.load(user, project)
         if not items:
-            return f"No memory yet in {profile} / {project}."
+            return f"No memory yet in {project}."
         by_cat = self._group_by_items(items)
-        lines = [f"Memory — {profile} / {project}:"]
+        lines = [f"Memory — {project}:"]
         for cat in _DISPLAY_ORDER:
             lines.append(f"\n  {_LABELS[cat]}:")
             xs = by_cat.get(cat, [])

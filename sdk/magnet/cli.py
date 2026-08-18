@@ -84,7 +84,6 @@ def _claude_md_block(user_id: str) -> str:
         "Whenever the user explicitly states a decision, preference, correction, or something to",
         "watch out for, call `remember` immediately (in the background — never announce it).",
         "",
-        "If the user types *profiles, call `list_profiles` and present the menu.",
         "If the user types *projects, call `list_projects` and present the menu.",
         "If the user types *save, call `save_now` (pass ALL messages so far) to do a",
         "cumulative save of everything up to this point.",
@@ -113,7 +112,7 @@ def _claude_md_block(user_id: str) -> str:
         "When the user asks what you know or remember, call `recall` or `show_project_memory`",
         "and answer ONLY from what those tools return — never guess or invent.",
         "",
-        "Never expose storage keys, project_ids, or backend details — show only profile/project names.",
+        "Never expose storage keys, project_ids, or backend details — show only project names.",
     ])
 
 
@@ -380,13 +379,12 @@ def _print_manual_block(user_id: str) -> None:
 # ── Local storage bootstrap ─────────────────────────────────────────────────────
 
 def _bootstrap_local_storage(user_id: str) -> None:
-    """Create the default personal/general profile+project and active.json. Tool-agnostic."""
+    """Create the default 'general' project and active.json. Tool-agnostic."""
     try:
         from magnet.local_store import SQLiteBackend
         from magnet.project_store import MemoryStore
         _store = MemoryStore(SQLiteBackend())
-        _store.create_profile(user_id, "personal")
-        _store.create_project(user_id, "personal", "general")
+        _store.create_project(user_id, "general")
     except Exception as exc:
         print(f"  Warning: could not init local storage: {exc}")
 
@@ -394,7 +392,7 @@ def _bootstrap_local_storage(user_id: str) -> None:
     try:
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
-            json.dumps({"profile": "personal", "project": "general"}, indent=2),
+            json.dumps({"project": "general"}, indent=2),
             encoding="utf-8",
         )
     except Exception as exc:
@@ -519,7 +517,7 @@ def cmd_init(manual: bool = False) -> None:
                 print("  Note: team memory won't work without MAGNET_REDIS_URL.")
         print()
 
-    # 3. Bootstrap default profile + project in local storage (tool-agnostic)
+    # 3. Bootstrap default project in local storage (tool-agnostic)
     _bootstrap_local_storage(user_id)
 
     # 4. Write configs for whatever was detected
@@ -584,7 +582,7 @@ def cmd_init(manual: bool = False) -> None:
     if not openai_key and found:
         print("  For smarter extraction, add MAGNET_OPENAI_KEY to your tool's MCP config.")
         print()
-    print("  Then type *profiles or *projects to get started.")
+    print("  Then type *projects to get started.")
     print()
 
 
