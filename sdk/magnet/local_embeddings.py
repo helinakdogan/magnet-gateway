@@ -31,6 +31,9 @@ _embedder: Any = None
 _embedder_available: bool | None = None  # None = not yet tried
 
 
+_EMBEDDER_INIT_TIMEOUT_S = 15.0
+
+
 def _get_embedder() -> Any:
     global _embedder, _embedder_available
     if _embedder_available is not None:
@@ -45,13 +48,41 @@ def _get_embedder() -> Any:
             )
             sys.stderr.flush()
         _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        # show_progress_bar is an encode()-time argument in current
-        # sentence-transformers, not a constructor kwarg — passing it here
-        # raised a TypeError on newer versions, which silently downgraded
-        # every caller to the keyword-overlap fallback.
-        _embedder = SentenceTransformer(_MODEL_NAME, cache_folder=str(_MODEL_DIR))
-        _embedder_available = True
-        logger.info(f"[magnet] Local embedder ready: {_MODEL_NAME}")
+
+        # Constructing SentenceTransformer downloads the model from
+        # HuggingFace Hub when it isn't already cached in _MODEL_DIR, with
+        # no timeout of its own — on a host where that download stalls
+        # (blocked/unreliable egress, slow DNS), this call can hang for
+        # minutes. Since this runs inline in live request paths
+        # (memory_requests' conflict-check, is_semantic_duplicate on every
+        # personal-memory write, rank_by_similarity on forget/mark_done
+        # fuzzy search) and even in a startup warm-up thread, an unbounded
+        # hang here doesn't just make ONE call slow — sustained CPU/network
+        # contention while it hangs is enough to make a small host miss its
+        # own health checks and get killed as "unhealthy" by Render. Bound
+        # it: a run that doesn't finish in time is treated exactly like any
+        # other failure — permanent keyword-fallback for this process,
+        # never retried, never blocking.
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(SentenceTransformer, _MODEL_NAME, cache_folder=str(_MODEL_DIR))
+            try:
+                # show_progress_bar is an encode()-time argument in current
+                # sentence-transformers, not a constructor kwarg — passing it
+                # here raised a TypeError on newer versions, which silently
+                # downgraded every caller to the keyword-overlap fallback.
+                _embedder = future.result(timeout=_EMBEDDER_INIT_TIMEOUT_S)
+                _embedder_available = True
+                logger.info(f"[magnet] Local embedder ready: {_MODEL_NAME}")
+            except FutureTimeoutError:
+                logger.warning(
+                    f"[magnet] Local embedder init exceeded {_EMBEDDER_INIT_TIMEOUT_S}s "
+                    "(likely a stalled model download) — keyword fallback active. "
+                    "The download thread is abandoned, not cancelled; it may still "
+                    "finish in the background, but this process won't wait on it again."
+                )
+                _embedder_available = False
     except ImportError:
         logger.info(
             "[magnet] sentence-transformers not installed — "
