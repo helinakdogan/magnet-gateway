@@ -59,30 +59,50 @@ def _get_embedder() -> Any:
         # fuzzy search) and even in a startup warm-up thread, an unbounded
         # hang here doesn't just make ONE call slow — sustained CPU/network
         # contention while it hangs is enough to make a small host miss its
-        # own health checks and get killed as "unhealthy" by Render. Bound
-        # it: a run that doesn't finish in time is treated exactly like any
-        # other failure — permanent keyword-fallback for this process,
-        # never retried, never blocking.
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        # own health checks and get killed as "unhealthy" by Render.
+        #
+        # Bound it with a plain daemon thread + join(timeout=...), NOT
+        # ThreadPoolExecutor — a `with ThreadPoolExecutor(...)` block calls
+        # shutdown(wait=True) on exit unconditionally, which blocks until
+        # the submitted work finishes regardless of any timeout passed to
+        # future.result(), completely defeating the purpose (this shipped
+        # once already and made the hang worse, not bounded — a thread pool
+        # someone can't walk away from isn't a timeout). A daemon thread's
+        # join(timeout=...) returns after the timeout no matter what the
+        # thread is still doing, and being daemonic means it never blocks
+        # process exit either.
+        import threading
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(SentenceTransformer, _MODEL_NAME, cache_folder=str(_MODEL_DIR))
+        _result: dict[str, Any] = {}
+
+        def _build_embedder() -> None:
             try:
                 # show_progress_bar is an encode()-time argument in current
                 # sentence-transformers, not a constructor kwarg — passing it
                 # here raised a TypeError on newer versions, which silently
                 # downgraded every caller to the keyword-overlap fallback.
-                _embedder = future.result(timeout=_EMBEDDER_INIT_TIMEOUT_S)
-                _embedder_available = True
-                logger.info(f"[magnet] Local embedder ready: {_MODEL_NAME}")
-            except FutureTimeoutError:
-                logger.warning(
-                    f"[magnet] Local embedder init exceeded {_EMBEDDER_INIT_TIMEOUT_S}s "
-                    "(likely a stalled model download) — keyword fallback active. "
-                    "The download thread is abandoned, not cancelled; it may still "
-                    "finish in the background, but this process won't wait on it again."
-                )
-                _embedder_available = False
+                _result["model"] = SentenceTransformer(_MODEL_NAME, cache_folder=str(_MODEL_DIR))
+            except Exception as e:
+                _result["error"] = e
+
+        thread = threading.Thread(target=_build_embedder, daemon=True)
+        thread.start()
+        thread.join(timeout=_EMBEDDER_INIT_TIMEOUT_S)
+
+        if thread.is_alive():
+            logger.warning(
+                f"[magnet] Local embedder init exceeded {_EMBEDDER_INIT_TIMEOUT_S}s "
+                "(likely a stalled model download) — keyword fallback active. "
+                "The download thread is abandoned (daemon), not cancelled; it may "
+                "still finish in the background, but this process won't wait on it again."
+            )
+            _embedder_available = False
+        elif "error" in _result:
+            raise _result["error"]
+        else:
+            _embedder = _result["model"]
+            _embedder_available = True
+            logger.info(f"[magnet] Local embedder ready: {_MODEL_NAME}")
     except ImportError:
         logger.info(
             "[magnet] sentence-transformers not installed — "
