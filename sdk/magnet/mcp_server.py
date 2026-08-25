@@ -18,7 +18,7 @@ Primary tools:
   show_project_memory  — display organized memory for the active project (with item IDs)
   forget_memory        — delete a memory item by id or text query (*forget trigger)
   mark_done            — mark a goal as completed instead of deleting it
-  recap                — synthesized natural-language catch-up (*recap trigger)
+  recap                — synthesized natural-language catch-up (*continue trigger)
   show_all_memory      — full dump of active project or bird's-eye across all (*memory trigger)
   list_projects        — TV menu: pick a project (*projects trigger)
   set_active_context   — set the active project
@@ -156,14 +156,22 @@ def _read_active_context() -> dict:
     return {}
 
 
-def _write_active_context(project: str) -> None:
-    payload = json.dumps({"project": project}, ensure_ascii=False)
+def _write_active_context(project: str, team_id: str = "") -> None:
+    """team_id is only ever set when `project` was activated FROM the
+    *projects menu's Team section (see _handle_set_active_context) — it
+    marks this project as living in team space, so remember/checkpoint/
+    save_now know to write there directly instead of to personal memory.
+    "" (the default) means a personal project, same as before this field
+    existed — old stored payloads with no team_id key read back as "" too,
+    via _read_active_context callers' own `.get("team_id") or ""`."""
+    data = {"project": project, "team_id": team_id}
+    payload = json.dumps(data, ensure_ascii=False)
     if _in_hosted_request():
         _get_backend().set(f"vmm:{_current_user_id()}:__active__", payload)
         return
     _ACTIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_FILE.write_text(
-        json.dumps({"project": project}, indent=2),
+        json.dumps(data, indent=2),
         encoding="utf-8",
     )
 
@@ -173,6 +181,25 @@ def _resolve_context(project: str | None = None) -> tuple[str, str]:
     active = _read_active_context()
     resolved_project = project or active.get("project") or "general"
     return _current_user_id(), resolved_project
+
+
+def _active_team_scope(explicit_project: str | None, resolved_project: str) -> str:
+    """Which team_id (if any) a WRITE to `resolved_project` should land in
+    directly, instead of personal memory. Only the ACTIVE project (no
+    explicit `project=` override passed to the tool call) can carry this —
+    it's set by _handle_set_active_context when the user picks a project
+    from *projects' Team section, and read back here by remember/checkpoint/
+    save_now. An explicit override has no such stored link and always
+    resolves to "" (personal), the same as before this field existed —
+    it never falls back to guessing via the session's own team membership,
+    since that would silently write an arbitrary project= argument into
+    team memory the caller never asked to activate."""
+    if explicit_project:
+        return ""
+    active = _read_active_context()
+    if active.get("project") != resolved_project:
+        return ""
+    return active.get("team_id") or ""
 
 
 def _ctx_tag(project: str) -> str:
@@ -225,12 +252,16 @@ def _write_rhythm(project: str, **updates: Any) -> None:
 
 
 async def _extract_from_messages(
-    messages: list[dict], user: str, project: str
+    messages: list[dict], user: str, project: str, team_id: str = ""
 ) -> tuple[int, str | None]:
     """Extract project-relevant insights from a message window and save to
-    MemoryStore. Returns (saved_count, cap_message) — cap_message is the
+    MemoryStore (or, if `team_id` is set — the active project was activated
+    as a team project, see _active_team_scope — directly to team memory
+    instead). Returns (saved_count, cap_message) — cap_message is the
     registered TeamBackend's own deny text, or None if nothing was capped
-    (always None for the default local/stdio backend, which is unlimited).
+    (always None for the default local/stdio backend, which is unlimited,
+    and never checked at all on the team-write path, which has its own
+    separate per-team sync cap enforced inside write_team_item).
 
     Whether a message is worth saving is decided entirely by the extractor
     (detect_category returning a real category vs None) plus MemoryStore's
@@ -258,6 +289,15 @@ async def _extract_from_messages(
         if category is None:
             continue
         text = compress_essence(text)
+
+        if team_id:
+            result = await asyncio.to_thread(
+                _get_team_backend().write_team_item, user, team_id, project, category, text
+            )
+            if result.get("written") or result.get("pending"):
+                saved += 1
+            continue
+
         cap_message = await _memory_cap_check(user)
         if cap_message:
             break
@@ -572,8 +612,9 @@ async def list_tools() -> list[types.Tool]:
                 "get one at agentmagnet.app. Setting MAGNET_REDIS_URL alone does "
                 "nothing; it only decides where shared data lives after a paid key "
                 "has already been verified. "
-                "Returns a team_id (e.g. 'team-a1b2c3') to share with teammates. "
-                "Teammates join with join_team(team_id)."
+                "Returns a team_id (e.g. 'team-a1b2c3'). "
+                "Teammates join via email invite from the dashboard's Team tab — "
+                "there is no manual join-by-id path."
             ),
             inputSchema={
                 "type": "object",
@@ -583,30 +624,12 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["team_name"],
             },
         ),
-        # ── TEAM: join_team ───────────────────────────────────────────────────
-        types.Tool(
-            name="join_team",
-            description=(
-                "Join an existing team by id. "
-                "Triggered by '*team join <team_id>'. "
-                "REQUIRES a paid Agent Magnet key (MAGNET_API_KEY, plan team/pro) — "
-                "get one at agentmagnet.app. The team_id is given by the team owner."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string", "description": "Team id to join (e.g. 'team-a1b2c3')"},
-                },
-                "required": ["team_id"],
-            },
-        ),
         # ── TEAM: add_team_member ─────────────────────────────────────────────
         types.Tool(
             name="add_team_member",
             description=(
                 "Owner adds a user directly to the team (owner-only). "
-                "The added user must also set MAGNET_TEAM_ID in their MCP config. "
-                "Alternative: share your team_id so they can run join_team themselves."
+                "The added user must also set MAGNET_TEAM_ID in their MCP config."
             ),
             inputSchema={
                 "type": "object",
@@ -617,72 +640,21 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["team_id", "user_id"],
             },
         ),
-        # ── TEAM: list_team_members ───────────────────────────────────────────
+        # ── TEAM: list_teams (*teams) ─────────────────────────────────────────
         types.Tool(
-            name="list_team_members",
+            name="list_teams",
             description=(
-                "Show all members of a team. "
-                "Triggered by '*team members'."
+                "Show your team(s): which team(s) you're in, which shared project(s) "
+                "you have access to and your role/permission in each, and the member list. "
+                "Triggered by '*teams'. "
+                "PERMISSION RULE (enforced server-side — never re-derive or override this "
+                "from the response): a LEAD sees full detail for every member (role + "
+                "per-project access). A plain MEMBER sees only other members' names/"
+                "nicknames — never their role, permission, or project access. Display "
+                "exactly what the response contains; do not infer or guess anyone else's "
+                "access level if the response doesn't include it."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string", "description": "Defaults to MAGNET_TEAM_ID env var"},
-                },
-                "required": [],
-            },
-        ),
-        # ── TEAM: list_team_projects ──────────────────────────────────────────
-        types.Tool(
-            name="list_team_projects",
-            description=(
-                "List projects that have been shared with the team, so a member can "
-                "discover and pick one even if their own local active project is "
-                "something else entirely. Triggered by '*team projects'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string", "description": "Defaults to MAGNET_TEAM_ID env var"},
-                },
-                "required": [],
-            },
-        ),
-        # ── TEAM: share_project_to_team ───────────────────────────────────────
-        types.Tool(
-            name="share_project_to_team",
-            description=(
-                "Copy the active project's memory into the team's shared space. "
-                "After this, all team members who recall or work in this project "
-                "will see the shared items labeled [team]. "
-                "Triggered by '*team share'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
-                    "project": {"type": "string", "description": "Defaults to active project"},
-                },
-                "required": [],
-            },
-        ),
-        # ── TEAM: share_item_to_team ──────────────────────────────────────────
-        types.Tool(
-            name="share_item_to_team",
-            description=(
-                "Share one specific memory item to the team by its item id. "
-                "Triggered by '*share <item_id>'. "
-                "Use show_project_memory to see item ids."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "item_id": {"type": "string", "description": "The 6-char item id to share"},
-                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
-                    "project": {"type": "string", "description": "Defaults to active project"},
-                },
-                "required": ["item_id"],
-            },
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # ── TEAM: get_team_memory ─────────────────────────────────────────────
         types.Tool(
@@ -727,8 +699,8 @@ async def list_tools() -> list[types.Tool]:
             name="request_team_write",
             description=(
                 "Ask a team lead to review one of your memory items before it enters "
-                "team memory, instead of sharing it directly. share_item_to_team and "
-                "share_project_to_team already queue a request automatically when a "
+                "team memory, instead of writing it directly. remember (when the active "
+                "project is a team project) already queues a request automatically when a "
                 "lead has restricted your writes — call this directly when you'd "
                 "rather ask for review even without an active restriction. "
                 "Triggered by '*team request <item_id>'."
@@ -750,7 +722,7 @@ async def list_tools() -> list[types.Tool]:
                 "LEAD-ONLY. Show every pending write request for the team, with a "
                 "conflict note if a request looks like it may overlap or contradict an "
                 "existing team item — surfaced so a lead never approves blind, but "
-                "never blocking the decision either way. Triggered by '*team pending'."
+                "never blocking the decision either way. Triggered by '*team memory pending'."
             ),
             inputSchema={
                 "type": "object",
@@ -767,7 +739,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "LEAD-ONLY. Approve a pending write request — writes it into team "
                 "memory, attributed to whoever originally requested it, not the "
-                "approving lead. Triggered by '*team approve <request_id>'. "
+                "approving lead. Triggered by '*team memory approve <request_id>'. "
                 "See list_pending_requests for ids."
             ),
             inputSchema={
@@ -786,7 +758,7 @@ async def list_tools() -> list[types.Tool]:
                 "LEAD-ONLY. Reject a pending write request — it never enters team "
                 "memory. The requester can still see their own request was declined; "
                 "it never becomes visible to the rest of the team. "
-                "Triggered by '*team reject <request_id>'."
+                "Triggered by '*team memory reject <request_id>'."
             ),
             inputSchema={
                 "type": "object",
@@ -797,13 +769,13 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["request_id"],
             },
         ),
-        # ── PRIMARY: recap (*recap) ───────────────────────────────────────────
+        # ── PRIMARY: recap (*continue) ────────────────────────────────────────
         types.Tool(
             name="recap",
             description=(
                 "SYNTHESIZED CATCH-UP — call when the user asks 'where were we', "
                 "'what were we doing', 'catch me up', 'remind me where we left off', "
-                "or types '*recap'. "
+                "or types '*continue'. "
                 "Pulls all memory for the active project and returns a natural prose summary — "
                 "like a helpful teammate catching you up. Lead with what was actually DONE "
                 "(actions) — that's more reliable than what was said and the most useful thing "
@@ -848,13 +820,21 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="list_projects",
             description=(
-                "TV MENU — projects. "
+                "TV MENU — projects, personal AND team. "
                 "Trigger: user types '*projects' OR says 'show projects', 'switch project', "
                 "'change project', 'list projects', 'my projects'. "
-                "Returns a numbered list of every project this user has. "
+                "Returns a numbered list grouped by section: 'Individual:' (this user's own "
+                "projects), then one 'Team <name> (<team_id>):' section per team they belong "
+                "to, listing that team's shared projects. "
                 "ALWAYS present it verbatim and wait for their choice. "
-                "When they pick → call set_active_context(project=<chosen>). "
-                "When they say 'new <name>' → call create_project(name=<name>)."
+                "When they pick a project under Individual → call "
+                "set_active_context(project=<chosen>). "
+                "When they pick a project under a Team section → call "
+                "set_active_context(project=<chosen>, team_id=<that section's team_id>) — "
+                "remember, *continue, *memory, and *forget then all operate on that team "
+                "project, respecting the team's write-permission/approval rules. "
+                "When they say 'new <name>' → call create_project(name=<name>) (always "
+                "personal — there is no menu option to create a brand new team project here)."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -862,13 +842,20 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="set_active_context",
             description=(
-                "Set the active project. Call after the user picks from a menu. "
+                "Set the active project — personal, or team if team_id is given. "
+                "Call after the user picks from the *projects menu. "
+                "Pass team_id ONLY when activating a project listed under a Team section "
+                "there; omit it for a personal (Individual) project. "
                 "Returns a confirmation string shown to the user."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "project": {"type": "string", "description": "Project name to activate"},
+                    "team_id": {
+                        "type": "string",
+                        "description": "Only when activating a TEAM project picked from *projects",
+                    },
                 },
                 "required": ["project"],
             },
@@ -924,13 +911,17 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["messages"],
             },
         ),
-        # ── PRIMARY: save_now (*save manual seal) ────────────────────────────
+        # ── PRIMARY: save_now (*remember manual seal) ─────────────────────────
         types.Tool(
             name="save_now",
             description=(
-                "MANUAL CUMULATIVE SAVE — triggered when user types '*save'. "
+                "MANUAL CUMULATIVE SAVE — triggered when user types '*remember'. Not to be "
+                "confused with the separate 'remember' tool (automatic, one insight at a "
+                "time) — this one is manual and cumulative, saving everything at once. "
                 "Pass ALL conversation messages accumulated so far (full history, not just recent). "
-                "Saves everything to the active project and resets the rhythm counter. "
+                "Saves everything to the active project (or, if the active project is a team "
+                "project, directly to team memory — same rules as the 'remember' tool) and "
+                "resets the rhythm counter. "
                 "Confirm to the user: 'Saved for (project). N items captured.'"
             ),
             inputSchema={
@@ -950,11 +941,11 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["messages"],
             },
         ),
-        # ── PRIMARY: get_status (*status) ────────────────────────────────────
+        # ── PRIMARY: get_status (*usage) ─────────────────────────────────────
         types.Tool(
             name="get_status",
             description=(
-                "MEMORY STATUS — triggered when user types '*status' or asks about memory, "
+                "MEMORY STATUS — triggered when user types '*usage' or asks about memory, "
                 "storage, or usage. Returns current active context, storage backend, "
                 "checkpoint history, usage counts, and plan info."
             ),
@@ -1093,8 +1084,7 @@ async def list_tools() -> list[types.Tool]:
 # count as a billable "sync request"; that's the whole point of gating it at
 # the permission layer instead of the dispatch layer.
 _TEAM_TOOL_NAMES = frozenset({
-    "create_team", "join_team", "add_team_member", "list_team_members",
-    "list_team_projects", "share_project_to_team", "share_item_to_team",
+    "create_team", "add_team_member", "list_teams",
     "get_team_memory", "request_team_write",
 })
 
@@ -1144,28 +1134,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "create_team":
             result = await _handle_create_team(team_name=arguments["team_name"])
-        elif name == "join_team":
-            result = await _handle_join_team(team_id=arguments["team_id"])
         elif name == "add_team_member":
             result = await _handle_add_team_member(
                 team_id=arguments["team_id"],
                 user_id=arguments["user_id"],
             )
-        elif name == "list_team_members":
-            result = await _handle_list_team_members(team_id=arguments.get("team_id"))
-        elif name == "list_team_projects":
-            result = await _handle_list_team_projects(team_id=arguments.get("team_id"))
-        elif name == "share_project_to_team":
-            result = await _handle_share_project_to_team(
-                team_id=arguments.get("team_id"),
-                project=arguments.get("project"),
-            )
-        elif name == "share_item_to_team":
-            result = await _handle_share_item_to_team(
-                item_id=arguments["item_id"],
-                team_id=arguments.get("team_id"),
-                project=arguments.get("project"),
-            )
+        elif name == "list_teams":
+            result = await _handle_list_teams()
         elif name == "get_team_memory":
             result = await _handle_get_team_memory(
                 team_id=arguments.get("team_id"),
@@ -1211,6 +1186,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         elif name == "set_active_context":
             result = await _handle_set_active_context(
                 project=arguments["project"],
+                team_id=arguments.get("team_id"),
             )
         elif name == "get_active_context":
             result = await _handle_get_active_context()
@@ -1303,7 +1279,7 @@ async def _handle_remember(
 ) -> str:
     from magnet.local_extractor import compress_essence
 
-    user, project = _resolve_context(project)
+    user, resolved_project = _resolve_context(project)
     store = _get_memory_store()
     usage = _get_usage_counter()
 
@@ -1317,50 +1293,71 @@ async def _handle_remember(
         extracted = ""
 
     if not extracted:
-        return f"Nothing to save. {_ctx_tag(project)}"
+        return f"Nothing to save. {_ctx_tag(resolved_project)}"
 
     # Essence compression is a backstop here, not the primary mechanism —
     # the tool description already instructs the calling model to write
     # telegraphically. This guarantees the cap holds even if it doesn't.
     extracted = compress_essence(extracted)
 
+    category = _SIGNAL_TO_CATEGORY.get(signal_type, "preference")
+    ctx = _ctx_tag(resolved_project)
+    preview = extracted[:80] + ("…" if len(extracted) > 80 else "")
+
+    team_id = _active_team_scope(project, resolved_project)
+    if team_id:
+        # The active project was activated FROM *projects' Team section
+        # (see _handle_set_active_context) — write there directly instead
+        # of personal memory, subject to the team's write-permission /
+        # approval-request rules. No separate "now share this" step.
+        result = await asyncio.to_thread(
+            _get_team_backend().write_team_item, user, team_id, resolved_project, category, extracted
+        )
+        if result.get("written"):
+            usage.record_team_write(team_id, resolved_project)
+            return f"Saved [{category}] to team memory: \"{preview}\" {ctx}"
+        if result.get("pending"):
+            return f"{result['message']} {ctx}"
+        if result.get("already_shared"):
+            return f"Already known (skipped duplicate): \"{preview[:60]}\" {ctx}"
+        return f"{result.get('message', 'Could not save to team memory.')} {ctx}"
+
     cap_msg = await _memory_cap_check(user)
     if cap_msg:
-        return f"{cap_msg} {_ctx_tag(project)}"
+        return f"{cap_msg} {ctx}"
 
-    category = _SIGNAL_TO_CATEGORY.get(signal_type, "preference")
     saved = await asyncio.to_thread(
-        store.add_entry, user, project, category, extracted,
+        store.add_entry, user, resolved_project, category, extracted,
         source_tool=_current_source_tool(), source_transport=_current_source_transport(),
     )
     if saved:
         await _record_memory_delta(user, 1)
-    usage.record_write(project)
-
-    ctx = _ctx_tag(project)
-    preview = extracted[:80] + ("…" if len(extracted) > 80 else "")
+    usage.record_write(resolved_project)
 
     auto_promoted = False
     if saved and _current_team_id():
-        # Every other team-touching path re-verifies live paid membership
-        # before touching team data — auto-promote must too. Without this, a
-        # stale team_id (a removed member, or a key downgraded off a paid
-        # plan) could still trigger a team-memory write with no live check
-        # at all, since _current_team_id() alone is not proof of current
+        # Legacy path: a project shared into team memory the old way (before
+        # per-project team activation existed via *projects) still
+        # auto-promotes agreeing items here, unchanged. Every other
+        # team-touching path re-verifies live paid membership before
+        # touching team data — auto-promote must too. Without this, a stale
+        # team_id (a removed member, or a key downgraded off a paid plan)
+        # could still trigger a team-memory write with no live check at
+        # all, since _current_team_id() alone is not proof of current
         # membership/plan. check_auto_promote() (the registered TeamBackend)
         # verifies this itself and returns False on ANY denial — a denial
         # here silently skips promotion, it must never fail the remember
         # call itself, so this stays inside a broad try/except.
         try:
-            items = await asyncio.to_thread(store.load, user, project)
+            items = await asyncio.to_thread(store.load, user, resolved_project)
             new_item = items[-1] if items else None
             if new_item:
                 auto_promoted = await asyncio.to_thread(
                     _get_team_backend().check_auto_promote,
-                    user, _current_team_id(), project, new_item,
+                    user, _current_team_id(), resolved_project, new_item,
                 )
                 if auto_promoted:
-                    usage.record_team_write(_current_team_id(), project)
+                    usage.record_team_write(_current_team_id(), resolved_project)
         except Exception as e:
             logger.debug(f"[team] auto-promote check failed: {e}")
 
@@ -1498,24 +1495,8 @@ async def _handle_create_team(team_name: str) -> str:
     _get_usage_counter().record_team_write(team_id)
     return (
         f"Team '{team_name}' created! Your team id: {team_id}\n\n"
-        f"Share this id with your teammates — they run:\n"
-        f"  *team join {team_id}\n\n"
-        f"Then they add MAGNET_TEAM_ID={team_id} to their MCP config and restart. "
-        f"[{team['plan']}]"
-    )
-
-
-async def _handle_join_team(team_id: str) -> str:
-    user = _current_user_id()
-    result = await asyncio.to_thread(_get_team_backend().join_team, user, team_id)
-    if "error" in result:
-        return result["message"]
-    team = result["team"]
-    _get_usage_counter().record_team_write(team_id)
-    return (
-        f"Joined team '{team['name']}' ({team_id}).\n\n"
-        f"Add MAGNET_TEAM_ID={team_id} to your MCP config env and restart Claude. "
-        f"Then your recalls and recaps will include shared team memory."
+        f"Invite teammates by email from the dashboard's Team tab — "
+        f"there's no manual join-by-id step. [{team['plan']}]"
     )
 
 
@@ -1526,23 +1507,6 @@ async def _handle_add_team_member(team_id: str, user_id: str) -> str:
         return result.get("message", "Could not add member.")
     _get_usage_counter().record_team_write(team_id)
     return f"{result['message']} They still need to add MAGNET_TEAM_ID={team_id} to their MCP config."
-
-
-async def _handle_list_team_members(team_id: str | None = None) -> str:
-    tid = team_id or _current_team_id()
-    if not tid:
-        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    result = await asyncio.to_thread(_get_team_backend().list_members, _current_user_id(), tid)
-    if "error" in result:
-        return result["message"]
-    team = result["team"]
-    members = result["members"]
-    lines = [f"Team: {team.get('name', tid)} ({tid})", ""]
-    for m in members:
-        role_tag = " (lead)" if m["role"] == "lead" else ""
-        lines.append(f"  · {m['user_id']}{role_tag}")
-    lines += ["", f"Total: {len(members)} member{'s' if len(members) != 1 else ''}"]
-    return "\n".join(lines)
 
 
 def _format_shared_projects_menu(team_id: str, shared_projects: list[dict]) -> str:
@@ -1556,72 +1520,43 @@ def _format_shared_projects_menu(team_id: str, shared_projects: list[dict]) -> s
     return "\n".join(lines)
 
 
-async def _handle_list_team_projects(team_id: str | None = None) -> str:
-    tid = team_id or _current_team_id()
-    if not tid:
-        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    result = await asyncio.to_thread(_get_team_backend().list_shared_projects, _current_user_id(), tid)
-    if "error" in result:
-        return result["message"]
-    shared_projects = result["shared_projects"]
-    if not shared_projects:
-        return f"No projects shared yet in team {tid}. Use *team share to share the active project."
-    return _format_shared_projects_menu(tid, shared_projects)
+async def _handle_list_teams() -> str:
+    user = _current_user_id()
+    my_teams = await asyncio.to_thread(_get_team_backend().list_my_teams, user)
+    teams = my_teams.get("teams", []) if isinstance(my_teams, dict) else []
+    if not teams:
+        return "You're not on any team yet. Use *team new <name> to create one."
 
+    sections = []
+    for t in teams:
+        tid = t.get("id")
+        result = await asyncio.to_thread(_get_team_backend().get_team_overview, user, tid)
+        if "error" in result:
+            sections.append(f"{t.get('name', tid)} ({tid}): {result['message']}")
+            continue
+        team = result["team"]
+        shared = result.get("shared_projects", [])
+        lines = [
+            f"{team.get('name', tid)} ({tid}) — {team.get('plan')}",
+            f"  Shared projects: {', '.join(shared) if shared else '(none yet)'}",
+        ]
+        if result.get("is_lead"):
+            lines.append("  Members:")
+            for m in result["members"]:
+                role_tag = " (lead)" if m["role"] == "lead" else ""
+                perms = m.get("project_permissions", {})
+                perm_str = ", ".join(f"{p}: {v}" for p, v in perms.items()) if perms else "no shared projects"
+                lines.append(f"    · {m['display_name']}{role_tag} — {perm_str}")
+        else:
+            lines.append(f"  Your role: {result.get('own_role', 'member')}")
+            own_perms = result.get("own_project_permissions", {})
+            if own_perms:
+                lines.append("  Your access: " + ", ".join(f"{p}: {v}" for p, v in own_perms.items()))
+            others = result.get("other_member_names", [])
+            lines.append(f"  Other members: {', '.join(others) if others else '(none)'}")
+        sections.append("\n".join(lines))
 
-async def _handle_share_project_to_team(
-    team_id: str | None = None,
-    project: str | None = None,
-) -> str:
-    tid = team_id or _current_team_id()
-    if not tid:
-        return "No team set. Use *team new <name> to create one first."
-    user, project = _resolve_context(project)
-    store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, project)
-    if not items:
-        return f"No memory in {project} to share yet."
-    result = await asyncio.to_thread(_get_team_backend().share_project, user, tid, project, items)
-    if "error" in result:
-        return result["message"]
-    _get_usage_counter().record_team_write(tid, project)
-    shared = result.get("shared", 0)
-    queued = result.get("queued", 0)
-    parts = []
-    if shared:
-        parts.append(f"Shared {shared} item{'s' if shared != 1 else ''}")
-    if queued:
-        parts.append(f"queued {queued} item{'s' if queued != 1 else ''} for lead approval")
-    summary = " and ".join(parts) if parts else "Nothing to share"
-    return (
-        f"{summary} from {project} → team {tid}.\n\n"
-        f"Team members who recall '{project}' will now see approved items labeled [team]."
-    )
-
-
-async def _handle_share_item_to_team(
-    item_id: str,
-    team_id: str | None = None,
-    project: str | None = None,
-) -> str:
-    tid = team_id or _current_team_id()
-    if not tid:
-        return "No team set. Use *team new <name> to create one first."
-    user, project = _resolve_context(project)
-    store = _get_memory_store()
-    items = await asyncio.to_thread(store.load, user, project)
-    item = next((i for i in items if i.get("id") == item_id), None)
-    if item is None:
-        return f"No item with id '{item_id}' found in personal memory."
-    result = await asyncio.to_thread(_get_team_backend().share_item, user, tid, project, item_id, item)
-    if "error" in result:
-        return result["message"]
-    if result.get("pending"):
-        return result["message"]
-    if result.get("already_shared"):
-        return f"Already shared: '{result['text']}'"
-    _get_usage_counter().record_team_write(tid, project)
-    return f"Shared [{result['category']}]: '{result['item']}' → team {tid} / {project}."
+    return "\n\n".join(sections)
 
 
 async def _handle_request_team_write(
@@ -1717,11 +1652,14 @@ async def _handle_get_team_memory(
             # Local active project pointed somewhere the team never shared —
             # the backend found the one project that IS shared; switching the
             # local active context to it is purely local state, done here.
-            _write_active_context(auto_selected)
+            _write_active_context(auto_selected, team_id=tid)
         return result["display_text"]
     if result.get("ambiguous"):
         return _format_shared_projects_menu(tid, result["shared_projects"])
-    return f"No projects shared yet in team {tid}. Use *team share to share the active project."
+    return (
+        f"No projects shared yet in team {tid}. Pick or create one via *projects, "
+        f"then *remember writes there directly."
+    )
 
 
 async def _handle_history(
@@ -1935,23 +1873,71 @@ async def _handle_show_all_memory(
 async def _handle_list_projects() -> str:
     user, _ = _resolve_context(None)
     store = _get_memory_store()
-    projects = await asyncio.to_thread(store.list_projects, user)
+    personal_projects = await asyncio.to_thread(store.list_projects, user)
 
-    lines = ["Your projects:"]
-    if projects:
-        for i, name in enumerate(projects, 1):
+    # Every team this user belongs to, each with its shared projects —
+    # so a team project is just as pickable here as a personal one (see
+    # _handle_set_active_context, which is what actually activates it).
+    team_sections: list[tuple[str, str, list[str]]] = []  # (team_name, team_id, [project, ...])
+    try:
+        my_teams = await asyncio.to_thread(_get_team_backend().list_my_teams, user)
+        teams = my_teams.get("teams", []) if isinstance(my_teams, dict) else []
+    except Exception:
+        teams = []
+    for team in teams:
+        tid = team.get("id")
+        if not tid:
+            continue
+        try:
+            result = await asyncio.to_thread(_get_team_backend().list_shared_projects, user, tid)
+        except Exception:
+            continue
+        shared = result.get("shared_projects", []) if "error" not in result else []
+        if shared:
+            team_sections.append((team.get("name", tid), tid, [p["project"] for p in shared]))
+
+    lines = ["Your projects:", "", "Individual:"]
+    if personal_projects:
+        for i, name in enumerate(personal_projects, 1):
             lines.append(f"  {i}. {name}")
     else:
         lines.append("  (none yet)")
+
+    n = len(personal_projects)
+    for team_name, tid, names in team_sections:
+        lines.append(f"Team {team_name} ({tid}):")
+        for name in names:
+            n += 1
+            lines.append(f"  {n}. {name}")
+
     lines.append("  + new project")
     lines.append("")
-    lines.append("Which one? (number or name) — or say 'new <name>' to create one.")
+    lines.append(
+        "Which one? (number or name) — or say 'new <name>' to create one. "
+        "Picking a team project activates it as team-shared: call "
+        "set_active_context(project=<name>, team_id=<that team's id>)."
+    )
     return "\n".join(lines)
 
 
-async def _handle_set_active_context(project: str) -> str:
+async def _handle_set_active_context(project: str, team_id: str | None = None) -> str:
     user = _current_user_id()
     store = _get_memory_store()
+
+    if team_id:
+        # Activating a TEAM project (picked from *projects' Team section) —
+        # verify it's genuinely shared before trusting the caller's claim;
+        # never silently create a personal project index entry for a
+        # team-owned name.
+        result = await asyncio.to_thread(_get_team_backend().list_shared_projects, user, team_id)
+        shared = {p["project"].strip().lower() for p in result.get("shared_projects", [])} if "error" not in result else set()
+        if project.strip().lower() not in shared:
+            return f"'{project}' is not a shared project in team {team_id}."
+        _write_active_context(project, team_id=team_id)
+        return (
+            f"Active: {project} (team {team_id}). "
+            "remember/recall/forget/*continue now operate on this team project."
+        )
 
     await asyncio.to_thread(store.create_project, user, project)
     _write_active_context(project)
@@ -1982,8 +1968,10 @@ async def _handle_checkpoint(
     messages: list[dict],
     project: str | None = None,
 ) -> str:
-    user, project = _resolve_context(project)
-    saved, cap_message = await _extract_from_messages(messages, user, project)
+    user, resolved_project = _resolve_context(project)
+    team_id = _active_team_scope(project, resolved_project)
+    project = resolved_project
+    saved, cap_message = await _extract_from_messages(messages, user, project, team_id)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         project,
@@ -2003,8 +1991,10 @@ async def _handle_save_now(
     messages: list[dict],
     project: str | None = None,
 ) -> str:
-    user, project = _resolve_context(project)
-    saved, cap_message = await _extract_from_messages(messages, user, project)
+    user, resolved_project = _resolve_context(project)
+    team_id = _active_team_scope(project, resolved_project)
+    project = resolved_project
+    saved, cap_message = await _extract_from_messages(messages, user, project, team_id)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         project,
@@ -2014,9 +2004,14 @@ async def _handle_save_now(
         last_items_saved=saved,
     )
     ctx = _ctx_tag(project)
+    cap_note = f" {cap_message}" if cap_message else ""
+    if team_id:
+        return (
+            f"Saved everything up to here for {ctx} — team {team_id}. "
+            f"{saved} new item{'s' if saved != 1 else ''} captured to team memory.{cap_note}"
+        )
     store = _get_memory_store()
     total = len(await asyncio.to_thread(store.load, user, project))
-    cap_note = f" {cap_message}" if cap_message else ""
     return (
         f"Saved everything up to here for {ctx}. "
         f"{saved} new item{'s' if saved != 1 else ''} captured. "

@@ -111,6 +111,12 @@ class HostedRelayTeamBackend:
     def list_members(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
         return self._op("list_team_members", team_id=team_id)
 
+    def list_my_teams(self, user_id: str) -> dict:  # noqa: ARG002
+        return self._op("list_my_teams")
+
+    def get_team_overview(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
+        return self._op("get_team_overview", team_id=team_id)
+
     # ── Shared project data ──────────────────────────────────────────────
 
     def load_team_items(self, user_id: str, team_id: str, project: str) -> list[dict]:  # noqa: ARG002
@@ -126,6 +132,9 @@ class HostedRelayTeamBackend:
 
     def share_item(self, user_id: str, team_id: str, project: str, item_id: str, item: dict) -> dict:  # noqa: ARG002
         return self._op("share_item_to_team", team_id=team_id, project=project, item_id=item_id, item=item)
+
+    def write_team_item(self, user_id: str, team_id: str, project: str, category: str, text: str) -> dict:  # noqa: ARG002
+        return self._op("write_team_item", team_id=team_id, project=project, category=category, text=text)
 
     def get_team_memory(self, user_id: str, team_id: str, project: str, explicit_project: bool) -> dict:  # noqa: ARG002
         return self._op(

@@ -55,6 +55,29 @@ class TeamBackend(Protocol):
         """{"team": {...}, "members": [{"user_id","role","joined_at"}]} or {"error","message"}."""
         ...
 
+    def list_my_teams(self, user_id: str) -> dict:
+        """Every team `user_id` is an ACTIVE member of. {"teams": [{"id","name",
+        "role",...}, ...]}. Never an {"error",...} shape — an unauthenticated
+        or unreachable case just returns {"teams": []}, since "which teams am
+        I in" is self-scoped and has no meaningful denial reason to surface.
+        Used by *projects (to list every team's shared projects alongside
+        personal ones) and *teams (to enumerate which teams to summarize)."""
+        ...
+
+    def get_team_overview(self, user_id: str, team_id: str) -> dict:
+        """Everything '*teams' shows for ONE team — assembled and
+        permission-filtered server-side, never left to the caller to trim.
+        {"team": {...}, "is_lead": bool, "shared_projects": [str, ...], ...}
+        plus, when is_lead is True:
+          "members": [{"user_id","role","display_name","status",
+                       "project_permissions": {project: permission, ...}}, ...]
+        or, when is_lead is False:
+          "own_role": str, "own_project_permissions": {project: permission},
+          "other_member_names": [str, ...]   — NAMES ONLY, never another
+              member's role or permission, even if asked a different way.
+        {"error", "message"} on denial (not a member, team not found, etc)."""
+        ...
+
     # ── Shared project data ──────────────────────────────────────────────
     def load_team_items(self, user_id: str, team_id: str, project: str) -> list[dict]:
         """The raw shared items for `project`, to merge with personal items
@@ -75,6 +98,23 @@ class TeamBackend(Protocol):
 
     def share_item(self, user_id: str, team_id: str, project: str, item_id: str, item: dict) -> dict:
         """{"shared": 1, "item", "category"} or {"already_shared": True, "text"} or {"error","message"}."""
+        ...
+
+    def write_team_item(self, user_id: str, team_id: str, project: str, category: str, text: str) -> dict:
+        """Write a NEW item directly into team memory for `project` — used
+        when the active project lives in team space (see mcp_server.
+        _handle_remember / _extract_from_messages and
+        _handle_set_active_context). Unlike share_item, there is no
+        pre-existing personal item to copy: this creates the item fresh,
+        attributed to user_id, and registers `project` as a shared team
+        project if it wasn't already (so a brand-new team project needs no
+        separate "create" step — the first successful write IS the create).
+        {"written": True, "item": {...}} on success,
+        {"already_shared": True, "text": ...} if a near-duplicate already
+        exists in team memory, {"pending": True, "request_id", "message"} if
+        a write restriction queues it for lead review instead, or
+        {"error", "message"} on denial (no write permission, not a member,
+        team not found/unpaid, etc)."""
         ...
 
     def get_team_memory(self, user_id: str, team_id: str, project: str, explicit_project: bool) -> dict:
