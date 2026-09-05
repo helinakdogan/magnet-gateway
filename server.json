@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.helinakdogan/agent-magnet",
   "description": "Behavioral memory layer for AI tools. Learns preferences and context across Claude, Cursor, Codex.",
-  "version": "0.1.33",
+  "version": "0.1.34",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "agent-magnet",
-      "version": "0.1.33",
+      "version": "0.1.34",
       "command": "agent-magnet-mcp",
       "transport": {
         "type": "stdio"
