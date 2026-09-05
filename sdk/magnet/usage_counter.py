@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_FILE = Path.home() / ".agent-magnet" / "usage.json"
 _REDIS_PREFIX = "magnet:usage:"
+_SAVINGS_REDIS_PREFIX = "magnet:savings:"
 
 
 class UsageCounter:
@@ -95,6 +96,57 @@ class UsageCounter:
             pass
         return {}
 
+    # ── Token-optimization savings — separate storage from the plain
+    # metrics above (get_stats() casts every value to int, which would
+    # truncate a fractional dollar amount to 0) ────────────────────────────
+
+    def record_savings(self, tokens_saved: int, usd: float) -> None:
+        if tokens_saved <= 0 and usd <= 0:
+            return
+        if self._redis:
+            try:
+                self._redis.hincrby(f"{_SAVINGS_REDIS_PREFIX}{self._user_id}", "tokens_saved", tokens_saved)
+                self._redis.hincrbyfloat(f"{_SAVINGS_REDIS_PREFIX}{self._user_id}", "usd_saved", usd)
+                return
+            except Exception:
+                pass
+        self._record_savings_local(tokens_saved, usd)
+
+    def _record_savings_local(self, tokens_saved: int, usd: float) -> None:
+        try:
+            data: dict = {}
+            if _LOCAL_FILE.exists():
+                data = json.loads(_LOCAL_FILE.read_text(encoding="utf-8"))
+            key = f"{self._user_id}:savings"
+            savings = data.setdefault(key, {"tokens_saved": 0, "usd_saved": 0.0})
+            savings["tokens_saved"] = savings.get("tokens_saved", 0) + tokens_saved
+            savings["usd_saved"] = savings.get("usd_saved", 0.0) + usd
+            _LOCAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _LOCAL_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logger.debug(f"[usage] local savings record failed: {e}")
+
+    def get_savings(self) -> dict:
+        if self._redis:
+            try:
+                raw = self._redis.hgetall(f"{_SAVINGS_REDIS_PREFIX}{self._user_id}")
+                if raw:
+                    return {
+                        "tokens_saved": int(float(raw.get("tokens_saved", 0))),
+                        "usd_saved": round(float(raw.get("usd_saved", 0.0)), 6),
+                    }
+            except Exception:
+                pass
+        try:
+            if _LOCAL_FILE.exists():
+                data = json.loads(_LOCAL_FILE.read_text(encoding="utf-8"))
+                saved = data.get(f"{self._user_id}:savings")
+                if saved:
+                    return {"tokens_saved": int(saved.get("tokens_saved", 0)), "usd_saved": round(float(saved.get("usd_saved", 0.0)), 6)}
+        except Exception:
+            pass
+        return {"tokens_saved": 0, "usd_saved": 0.0}
+
     # ── Enforcement hook (TODO: plug tier limits here) ────────────────────────
 
     def check_usage_limit(self, metric: str = "writes:total") -> bool:  # noqa: ARG002
@@ -146,23 +198,54 @@ def check_usage_limit(user_id: str, team_id: str = "") -> bool:  # noqa: ARG001
     return True
 
 
-def record_usage_event(user_id: str, team_id: str, event_type: str, key_id: str | None = None) -> None:
+def record_usage_event(
+    user_id: str,
+    team_id: str,
+    event_type: str,
+    key_id: str | None = None,
+    tokens_saved: int | None = None,
+    usd_saved: float | None = None,
+) -> None:
     """Best-effort INSERT into usage_events. No-op outside hosted/Postgres
     mode. Metering must never break a tool call — all failures are swallowed
     (logged at debug level only). key_id (the mg_sk_... key that made this
     call, if any) is optional and used only for per-key usage breakdowns —
-    never for identity/authorization."""
+    never for identity/authorization. tokens_saved/usd_saved are optional
+    and only set by token-optimization events (compression, cache hits) —
+    every other event type leaves them NULL."""
     pool = _pool_if_configured()
     if pool is None:
         return
     try:
         with pool.connection() as conn:
             conn.execute(
-                "INSERT INTO usage_events (user_id, team_id, event_type, key_id) VALUES (%s, %s, %s, %s)",
-                (user_id, team_id or None, event_type, key_id),
+                "INSERT INTO usage_events (user_id, team_id, event_type, key_id, tokens_saved, usd_saved) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (user_id, team_id or None, event_type, key_id, tokens_saved, usd_saved),
             )
     except Exception as e:
         logger.debug(f"[usage] record_usage_event failed: {e}")
+
+
+def get_usd_saved_this_month(user_id: str) -> float:
+    """SUM(usd_saved) across every token-optimization event this calendar
+    month — the headline number for *usage and the dashboard's Usage tab.
+    Returns 0.0 (not None) outside hosted/Postgres mode so callers can
+    always display a number rather than branch on availability."""
+    pool = _pool_if_configured()
+    if pool is None:
+        return 0.0
+    try:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usd_saved), 0) FROM usage_events "
+                "WHERE user_id = %s AND created_at >= date_trunc('month', now())",
+                (user_id,),
+            ).fetchone()
+        return round(float(row[0]), 6) if row else 0.0
+    except Exception as e:
+        logger.debug(f"[usage] get_usd_saved_this_month failed: {e}")
+        return 0.0
 
 
 def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  # noqa: ARG001
@@ -170,6 +253,12 @@ def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  #
     Returns {event_type: count} for the current calendar month, or None if
     not running in hosted/Postgres mode. Feeds get_status's HTTP response
     (plan, memories stored, reads/writes this period).
+
+    Excludes "token_optimization:*" rows — those are metadata about an
+    ALREADY-counted tool call (e.g. a "recall" row plus a
+    "token_optimization:recall_injection" row for the same request), not a
+    second billable request. Counting them here would double-count sync
+    usage against the plan's request cap.
     """
     pool = _pool_if_configured()
     if pool is None:
@@ -180,6 +269,7 @@ def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  #
                 """
                 SELECT event_type, COUNT(*) FROM usage_events
                 WHERE user_id = %s AND created_at >= date_trunc('month', now())
+                  AND event_type NOT LIKE 'token_optimization:%%'
                 GROUP BY event_type
                 """,
                 (user_id,),

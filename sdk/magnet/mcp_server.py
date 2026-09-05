@@ -47,8 +47,14 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from magnet.team_backend import get_team_backend as _get_team_backend
+from magnet.token_optimizer import compress_and_verify, SemanticCache
 
 logger = logging.getLogger(__name__)
+
+# Namespaced by "recap:{project}:{model}" at each call site — a model
+# upgrade lands in a different namespace and naturally forces a fresh call
+# instead of silently serving a cheaper model's cached prose.
+_recap_cache = SemanticCache()
 
 _DEFAULT_USER_ID = os.environ.get("MAGNET_USER_ID", "user")
 _DEFAULT_TEAM_ID = os.environ.get("MAGNET_TEAM_ID", "")
@@ -1073,6 +1079,48 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["cache_key"],
             },
         ),
+        # ── GitHub repo connection (light index, fetch on demand) ────────────
+        types.Tool(
+            name="connect_github",
+            description=(
+                "Triggered by '*connect github <repo-url>' or '*connect github "
+                "<repo-url> <token>'. Connects a GitHub repository to the active "
+                "project by building a LIGHT INDEX ONLY — the file tree (paths) "
+                "plus, for markdown files, just the first heading. It does NOT "
+                "fetch or store any file's full content. Pass a GitHub Personal "
+                "Access Token (repo/Contents:Read scope) for a private repo — it's "
+                "encrypted before storage and reused for every later fetch. After "
+                "connecting, use github_recall to answer a specific question, which "
+                "fetches only the file(s) that question actually needs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_url": {"type": "string", "description": "e.g. https://github.com/owner/repo or 'owner/repo'"},
+                    "token": {"type": "string", "description": "GitHub Personal Access Token — required for a private repo."},
+                },
+                "required": ["repo_url"],
+            },
+        ),
+        types.Tool(
+            name="github_recall",
+            description=(
+                "Answers a question about the project's connected GitHub repo (see "
+                "connect_github). Matches the question against the light index to "
+                "find the most relevant file(s) by name/heading, fetches ONLY those "
+                "file(s) from GitHub, compresses them, and adds the result to memory. "
+                "A file already fetched in a prior call is served from memory "
+                "instead of being re-fetched, unless refresh=true is passed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "refresh": {"type": "boolean", "description": "Force re-fetching even if already cached."},
+                },
+                "required": ["question"],
+            },
+        ),
     ]
 
 
@@ -1098,6 +1146,29 @@ def _record_usage_event(tool_name: str) -> None:
         record_usage_event(_current_user_id(), _current_team_id(), tool_name, key_id=_current_key_id())
     except Exception as e:
         logger.debug(f"[usage] _record_usage_event failed: {e}")
+
+
+def _record_savings(source: str, tokens_before: int, tokens_after: int, usd: float) -> None:
+    """Records a token-optimization win (a compression or a cache hit) to
+    BOTH the local counter (so `*usage` shows a running total even in
+    plain stdio mode, no Postgres) and the hosted event log (so the
+    dashboard's Usage tab and month-to-date totals see it too). Never
+    raises — a savings-tracking bug must not break the win it's tracking."""
+    tokens_saved = max(0, tokens_before - tokens_after)
+    if tokens_saved <= 0 and usd <= 0:
+        return
+    try:
+        _get_usage_counter().record_savings(tokens_saved, usd)
+    except Exception as e:
+        logger.debug(f"[token_optimizer] local savings record failed: {e}")
+    try:
+        from magnet.usage_counter import record_usage_event
+        record_usage_event(
+            _current_user_id(), _current_team_id(), f"token_optimization:{source}",
+            key_id=_current_key_id(), tokens_saved=tokens_saved, usd_saved=usd,
+        )
+    except Exception as e:
+        logger.debug(f"[token_optimizer] hosted savings record failed: {e}")
 
 
 @app.call_tool()
@@ -1220,6 +1291,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "retrieve_original":
             result = await _handle_retrieve_original(arguments["cache_key"])
+        elif name == "connect_github":
+            result = await _handle_connect_github(repo_url=arguments["repo_url"], token=arguments.get("token"))
+        elif name == "github_recall":
+            result = await _handle_github_recall(
+                question=arguments["question"],
+                refresh=bool(arguments.get("refresh", False)),
+            )
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -1259,6 +1337,17 @@ async def _handle_recall(project: str | None = None) -> str:
             f"Fresh start — no memory yet for {project}{team_note}. "
             f"I'll remember things as we work together. {ctx}"
         )
+
+    # Compress the injection body before it goes out — this text becomes
+    # part of whatever prompt the calling tool (Claude/Cursor/Codex) sends
+    # its own model next, so trimming filler here is trimming real tokens
+    # off that call. compress_and_verify() never ships a compression that
+    # embedding similarity says changed the meaning — on a failed check
+    # `body` comes back untouched, so this can't make recall less accurate.
+    optimized = await asyncio.to_thread(compress_and_verify, body)
+    if optimized["compressed"]:
+        body = optimized["text"]
+        _record_savings("recall_injection", optimized["tokens_before"], optimized["tokens_after"], optimized["usd_saved"])
 
     team_note = f"\n[Team context from {team_id} is included — items marked [team].]" if team_items else ""
     lines = [
@@ -1741,8 +1830,25 @@ def _recap_template(project: str, by_cat: dict) -> str:
 
 
 async def _recap_with_llm(project: str, by_cat: dict, openai_key: str) -> str:
-    """LLM-synthesized recap — natural prose, like a teammate catching you up."""
+    """LLM-synthesized recap — natural prose, like a teammate catching you up.
+
+    Two token-optimization layers, in order:
+    1. Semantic cache — if this project's memory state hasn't meaningfully
+       changed since the last recap (near-identical `memory_text`), skip
+       the LLM call entirely and return the cached prose. Namespaced by
+       model, so switching MAGNET_RECAP_MODEL to a pricier model can't
+       silently serve a cheaper model's cached output — it forces one real
+       call, but...
+    2. ...that real call still compresses `memory_text` first, verified
+       against the original via embedding similarity. The compression
+       cache is keyed on content only (see token_optimizer.py), so an
+       escalation to a pricier model reuses it instead of re-paying for
+       compression it already did on the cheap model's call.
+    """
     import litellm
+    from magnet.token_optimizer import count_tokens, usd_saved as _usd_saved
+
+    model = os.environ.get("MAGNET_RECAP_MODEL", "openai/gpt-4o-mini")
 
     actions      = [t for t, _ in by_cat.get("action", [])][-8:]
     active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
@@ -1764,27 +1870,43 @@ async def _recap_with_llm(project: str, by_cat: dict, openai_key: str) -> str:
     if preferences:   sections.append("Preferences: " + "; ".join(preferences))
 
     memory_text = "\n".join(f"- {s}" for s in sections)
-    prompt = (
-        f"You are catching up a developer on their '{project}' project. "
-        "Write a brief 2-4 sentence recap, like a helpful teammate. "
-        "Lead with what was actually DONE (the 'Actually done' items are completed work, "
-        "more reliable than stated intentions) — that's the most useful thing for resuming "
-        "work — then mention the key decisions made, flag any watch-outs or failed approaches, "
-        "and end with the open goal or next step. "
-        "Sound natural and conversational — NOT like a bullet list or database report.\n\n"
-        f"Memory:\n{memory_text}\n\nRecap:"
-    )
+
+    def _build_prompt(mem_text: str) -> str:
+        return (
+            f"You are catching up a developer on their '{project}' project. "
+            "Write a brief 2-4 sentence recap, like a helpful teammate. "
+            "Lead with what was actually DONE (the 'Actually done' items are completed work, "
+            "more reliable than stated intentions) — that's the most useful thing for resuming "
+            "work — then mention the key decisions made, flag any watch-outs or failed approaches, "
+            "and end with the open goal or next step. "
+            "Sound natural and conversational — NOT like a bullet list or database report.\n\n"
+            f"Memory:\n{mem_text}\n\nRecap:"
+        )
+
+    cache_namespace = f"recap:{project}:{model}"
+    cached = await asyncio.to_thread(_recap_cache.lookup, cache_namespace, memory_text)
+    if cached:
+        avoided_tokens = count_tokens(_build_prompt(memory_text), model)
+        _record_savings("recap_cache_hit", avoided_tokens, 0, _usd_saved(avoided_tokens, 0, model))
+        return cached
+
+    optimized = await asyncio.to_thread(compress_and_verify, memory_text, model)
+    prompt_memory_text = optimized["text"] if optimized["compressed"] else memory_text
+    if optimized["compressed"]:
+        _record_savings("recap_compression", optimized["tokens_before"], optimized["tokens_after"], optimized["usd_saved"])
+    prompt = _build_prompt(prompt_memory_text)
 
     try:
         response = await asyncio.to_thread(
             litellm.completion,
-            model="openai/gpt-4o-mini",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             api_key=openai_key,
             max_tokens=220,
         )
         text = (response.choices[0].message.content or "").strip()
         if text:
+            await asyncio.to_thread(_recap_cache.store, cache_namespace, memory_text, text)
             return text
     except Exception as e:
         logger.warning(f"[recap] LLM failed ({e}), falling back to template")
@@ -2173,8 +2295,25 @@ async def _promote_summary_to_memory(
 
 async def _handle_usage_stats() -> dict:
     _, project = _resolve_context()
-    stats = _get_usage_counter().get_stats()
+    counter = _get_usage_counter()
+    stats = counter.get_stats()
+    local_savings = counter.get_savings()
+
+    # Hosted month-to-date total (0.0, not an error, outside hosted mode) —
+    # this is the number that sells the product, so it leads the response
+    # rather than sitting inside the raw stats dict. Dollars, never token
+    # counts: nobody has an intuition for "40,000 tokens", everybody has
+    # one for "$3.20".
+    try:
+        from magnet.usage_counter import get_usd_saved_this_month
+        hosted_usd_this_month = get_usd_saved_this_month(_current_user_id())
+    except Exception:
+        hosted_usd_this_month = 0.0
+
+    dollars_saved_this_month = round(max(hosted_usd_this_month, local_savings["usd_saved"]), 2)
+
     return {
+        "dollars_saved_this_month": f"${dollars_saved_this_month:.2f}",
         "user": _current_user_id(),
         "active_context": _ctx_tag(project),
         "stats": stats,
@@ -2204,6 +2343,126 @@ async def _handle_retrieve_original(cache_key: str) -> dict:
     if original is None:
         return {"error": f"No cached original for key '{cache_key}'"}
     return {"original_text": original, "cache_key": cache_key}
+
+
+# ── GitHub repo connection (Context7-style: light index, fetch on demand) ─────
+
+async def _handle_connect_github(repo_url: str, token: str | None = None) -> dict:
+    from magnet import github_index
+
+    user, project = _resolve_context(None)
+
+    # Fail closed, exactly like team_permissions.encrypt_redis_url: a token
+    # this function can't encrypt is a token it must refuse to keep, not one
+    # it silently stores in plaintext or silently drops after this call.
+    token_enc = None
+    if token:
+        token_enc = github_index.encrypt_token(token)
+        if token_enc is None:
+            return {
+                "error": (
+                    "A token was provided but this server has no MAGNET_ENCRYPTION_KEY "
+                    "configured, so it can't be stored encrypted. Set MAGNET_ENCRYPTION_KEY "
+                    "and try again — the token is never stored in plaintext."
+                )
+            }
+
+    try:
+        owner, repo = github_index.parse_repo_url(repo_url)
+        index = await asyncio.to_thread(github_index.build_index, owner, repo, token)
+    except github_index.GithubFetchError as e:
+        return {"error": str(e)}
+
+    # build_index() already encrypts internally when given a plaintext
+    # token, but only if MAGNET_ENCRYPTION_KEY exists — this repeats the
+    # same encrypted value we already validated above (or None), rather
+    # than trusting the index's own encryption to have silently succeeded.
+    index["token_enc"] = token_enc
+    index["has_token"] = bool(token_enc)
+
+    backend = _get_backend()
+    await asyncio.to_thread(github_index.save_index, backend, user, index)
+    await asyncio.to_thread(github_index.set_active_repo, backend, user, project, owner, repo)
+
+    return {
+        "connected": f"{owner}/{repo}",
+        "branch": index["branch"],
+        "project": project,
+        "file_count": index["file_count"],
+        "private": bool(token),
+        "sample_files": [f["label"] for f in index["files"][:8]],
+        "note": (
+            "Light index only — no file content fetched yet. Ask a question "
+            "about this repo (github_recall) and only the relevant file(s) "
+            "will be fetched."
+        ),
+    }
+
+
+async def _handle_github_recall(question: str, refresh: bool = False) -> dict:
+    from magnet import github_index
+    from magnet.token_optimizer import compress_and_verify
+
+    user, project = _resolve_context(None)
+    backend = _get_backend()
+
+    active = await asyncio.to_thread(github_index.get_active_repo, backend, user, project)
+    if not active:
+        return {"error": "No GitHub repo connected for this project. Use '*connect github <repo-url>' first."}
+    owner, repo = active
+
+    index = await asyncio.to_thread(github_index.load_index, backend, user, owner, repo)
+    if not index:
+        return {"error": f"No index found for {owner}/{repo}. Reconnect with '*connect github {owner}/{repo}'."}
+
+    matches = await asyncio.to_thread(github_index.find_relevant_files, index, question)
+    if not matches:
+        return {"error": f"No file in {owner}/{repo}'s index looked relevant to that question."}
+
+    token = github_index.decrypt_token(index["token_enc"]) if index.get("token_enc") else None
+
+    store = _get_memory_store()
+    results = []
+    for match in matches:
+        path = match["path"]
+        if match.get("fetched") and not refresh:
+            results.append({
+                "path": path, "source": "cache",
+                "message": "Already fetched in a prior call — served from memory, not re-fetched.",
+            })
+            continue
+
+        raw = await asyncio.to_thread(github_index.fetch_file, owner, repo, index["branch"], path, token)
+        if raw is None:
+            results.append({"path": path, "source": "error", "message": "Fetch failed."})
+            continue
+
+        optimized = await asyncio.to_thread(compress_and_verify, raw)
+        text = optimized["text"] if optimized["compressed"] else raw
+        # A whole file, even compressed, can still be long — this is a
+        # context injection, not a second copy of the file living in
+        # memory, so a single item stays capped.
+        text = text[:4000]
+
+        await asyncio.to_thread(
+            store.add_entry, user, project, "convention",
+            f"[{owner}/{repo}:{path}] {text}",
+            dedup=False, source_tool="github",
+        )
+        github_index.mark_fetched(index, path)
+        results.append({
+            "path": path, "source": "github", "message": "Fetched from GitHub and added to memory.",
+            "tokens_before": optimized.get("tokens_before") or None,
+            "tokens_after": optimized.get("tokens_after") or None,
+        })
+
+    await asyncio.to_thread(github_index.save_index, backend, user, index)
+    return {
+        "repo": f"{owner}/{repo}",
+        "question": question,
+        "files_checked": [m["path"] for m in matches],
+        "results": results,
+    }
 
 
 # ── Prompt (MCP prompts API) ──────────────────────────────────────────────────

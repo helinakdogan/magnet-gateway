@@ -22,6 +22,7 @@ dependencies = [
     "python-dotenv",
     "sentence-transformers>=2.2",
     "uvicorn",
+    "cryptography>=42.0",
 ]
 
 [project.urls]
