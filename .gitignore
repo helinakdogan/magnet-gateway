@@ -8,6 +8,8 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 dist/
+build/
+sdk/build/
 .DS_Store
 *.log
 .vscode/
@@ -26,3 +28,5 @@ inspect_memory.py
 CLAUDE.md
 venv310
 test_mcp.py
+architecture.md
+conversation.md
